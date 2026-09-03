@@ -1,0 +1,7 @@
+# Pinned to 0.2.13: it is the newest release with prebuilt Windows wheels for
+# CPython 3.9-3.13. 0.2.14 is source-only and needs a Rust toolchain to build.
+aardwolf==0.2.13
+
+# Pillow comes in via aardwolf and is what turns the desktop buffer into a PNG.
+# tkinter (for gui.py) ships with the standard Windows Python installer.
+# The remembered-credentials store uses DPAPI via ctypes -- no dependency.

@@ -1,0 +1,19 @@
+# Remembered credentials live in %LOCALAPPDATA%, not here, but just in case
+profile.json
+.env
+
+# Emergency stop sentinel
+STOP
+
+# Captured screens and logs
+screenshots/
+*.png
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
