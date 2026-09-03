@@ -78,16 +78,15 @@ The **target must be Windows** — that is what speaks RDP and runs the editor.
 The **client** is mostly portable: `aardwolf` has Linux wheels, and the input,
 screenshot and codebase code is plain Python. Two things are Windows-only:
 
-* **tkinter needs a display.** On a headless VPS there is no X server, so the
-  GUI — the only entry point — cannot open. You would need X11 forwarding
-  (`ssh -X`), or `Xvfb` plus a VNC server, or a headless mode this project does
-  not currently have.
+* **tkinter needs a display.** On a headless VPS there is no X server, so
+  `gui.py` cannot open — use **`cli.py`** instead, which offers the same five
+  actions from a terminal and never imports tkinter.
 * **Remembering the password uses DPAPI**, which is a Windows API. Off Windows
   it degrades cleanly: the rest of the profile is still saved and the password
   is simply asked for each time, or taken from `RDP_PASSWORD`.
 
-So: a Linux VPS with a desktop or X forwarding will run it. A bare headless VPS
-will not, until a headless mode is added.
+So a headless Linux VPS runs it fine through `cli.py`; `gui.py` needs a
+desktop or X forwarding.
 
 ## 3. Windows prerequisites
 
@@ -192,12 +191,55 @@ Test-NetConnection -ComputerName SERVER -Port 3389
 
 ## 8. Running it
 
-**`gui.py` is the only entry point.** Every other file is a module of the
-application and refuses to run on its own:
+There are **two entry points**, one per environment. Every other file is a
+module and refuses to run on its own:
 
 ```powershell
-python gui.py
+python gui.py     # desktop: a window
+python cli.py     # server:  a terminal, no tkinter
 ```
+
+Both offer the same five actions, share the same remembered profile, and run
+the same code underneath — `run_session` for the demos, `run_codebase_session`
+for repositories — so behaviour never drifts between them.
+
+### `cli.py`, for a VPS
+
+```bash
+python cli.py                                    # menu, prompts for what is missing
+python cli.py demo --editor code
+python cli.py repo https://github.com/pallets/click --minutes 30
+python cli.py repo https://github.com/me/proj --minutes 0    # no limit
+python cli.py test                               # interactive rdp> prompt
+python cli.py --forget
+```
+
+With no arguments it prompts, offering everything it already knows as a default
+you accept with Enter, then shows a numbered menu:
+
+```
+What would you like to run?
+  1) Connection test        - an interactive rdp> prompt
+  2) Editor demo, Notepad   - type a generated Python file
+  3) Editor demo, VS Code   - the same, in VS Code
+  4) Type a codebase        - clone a git repo, into Notepad
+  5) Type a codebase        - clone a git repo, into VS Code
+  q) Quit
+```
+
+Give it an action on the command line and it stops prompting, so it works from
+cron or systemd — set `RDP_PASSWORD` in the environment, or save it beforehand.
+Missing values produce a clear error and exit 2 rather than blocking on a
+prompt that nobody is there to answer.
+
+Exit codes: `0` success, `1` connection failed, `2` configuration, `3`
+emergency stop, `4` session stopped accepting input, `5` input error, `6`
+repository problem, `130` interrupted.
+
+There is no live view in the CLI — it is a picture, and a terminal is not. The
+screenshots still land in `screenshots/`.
+
+### `gui.py`, for a desktop
 
 A connection form appears, prefilled with whatever was remembered last time.
 Pick one of five actions and press **Connect**:
@@ -783,7 +825,8 @@ Run with `RDP_LOG_LEVEL=DEBUG` for protocol-level detail, and
 
 ```
 rdp-background-automation/
-├── gui.py             # THE ENTRY POINT: form, runner window, STOP button
+├── gui.py             # ENTRY POINT (desktop): form, runner window, live view
+├── cli.py             # ENTRY POINT (server): menu and flags, no tkinter
 ├── main.py            # command dispatch and the asyncio loop thread
 ├── demo.py            # editor profiles, the generated-file demo, codebase typing
 ├── codebase.py        # git clone, file selection, time budgeting
@@ -797,8 +840,9 @@ rdp-background-automation/
 └── README.md
 ```
 
-Only `gui.py` is runnable. The others raise a message pointing at it, so there
-is one way in and no half-configured second path to keep working.
+Only `gui.py` and `cli.py` are runnable; the others raise a message pointing at
+them. The two front ends are thin — they collect settings and call the same
+shared coroutines — so there is no second implementation to keep in step.
 
 ## 17. Scope
 

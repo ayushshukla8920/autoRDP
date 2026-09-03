@@ -340,5 +340,5 @@ def _coords(raw_x: str, raw_y: str, settings: Settings) -> tuple[int, int]:
 if __name__ == "__main__":
     raise SystemExit(
         "main.py is part of the application, not an entry point. "
-        "Start it from the GUI instead:  python gui.py"
+        "Start it with:  python gui.py   (desktop)  or  python cli.py   (server)"
     )

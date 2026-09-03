@@ -17,6 +17,7 @@ import sys
 import time
 from datetime import datetime
 
+import codebase
 from code_generator import generate
 from config import ConfigError, Settings, setup_logging
 from input_events import EmergencyStopped, InputError, SessionNotAcceptingInput
@@ -161,6 +162,68 @@ async def run_session(client: RdpClient, args: argparse.Namespace) -> None:
     await run_demo(client, args)
 
 
+async def run_codebase_session(client: RdpClient, args: argparse.Namespace,
+                               url: str, budget_seconds: float) -> None:
+    """Clone a repository, pick what fits the budget, connect, and type it.
+
+    Shared by both front ends: the GUI runs it on its loop thread, the CLI on
+    the main one. Everything is reported with ``print`` so both see the same
+    progress.
+    """
+    settings = client.settings
+    profile = EDITORS[args.editor]
+
+    step(1, f"Cloning {url}")
+    # Cloning and walking the tree are blocking work; keep them off the loop.
+    checkout = await asyncio.to_thread(codebase.clone, url)
+    print(f"    into {checkout}")
+
+    step(2, "Selecting files")
+    files, skipped = await asyncio.to_thread(codebase.collect, checkout)
+    if not files:
+        raise codebase.CodebaseError(
+            "No typable source files found. The repository may contain only "
+            "binaries, very large files, or unsupported extensions.")
+    print(f"    {len(files)} candidate file(s), "
+          f"{sum(f.characters for f in files):,} characters")
+    if skipped:
+        print(f"    {len(skipped)} skipped, first few:")
+        for line in skipped[:5]:
+            print(f"      - {line}")
+
+    chosen, dropped, estimate = codebase.plan(
+        files, settings, profile["editor_safe"], budget_seconds)
+    whole = sum(codebase.seconds_for(f, settings, profile["editor_safe"])
+                for f in files)
+    step(3, "Estimating")
+    print(f"    Typing runs at roughly 20-25 characters a second, so the whole "
+          f"repository would take {codebase.human_time(whole)}.")
+    if budget_seconds > 0:
+        print(f"    Budget is {budget_seconds / 60:.0f} min: typing "
+              f"{len(chosen)} file(s), about {codebase.human_time(estimate)}.")
+    else:
+        print(f"    No budget set: typing all {len(chosen)} file(s), "
+              f"about {codebase.human_time(estimate)}.")
+    if dropped:
+        print(f"    {len(dropped)} file(s) left out; raise the budget "
+              f"(or set it to 0) to include more.")
+
+    step(4, f"Connecting to {settings.target}")
+    await client.connect()
+    print("    Connected successfully")
+    settings.remember(remember_password=args.remember)
+
+    step(5, "Waiting for the remote desktop to finish starting up")
+    settled = await client.wait_for_desktop(timeout=args.startup_timeout)
+    print("    desktop has settled" if settled
+          else "    gave up waiting; continuing on the configured delays")
+    await _settle(args.startup_wait)
+
+    remote_root = f"{args.remote_dir.rstrip(chr(92))}\\{codebase.slug(url)}"
+    step(6, f"Typing into {remote_root}")
+    await type_codebase(client, args, chosen, remote_root)
+
+
 async def type_codebase(client: RdpClient, args: argparse.Namespace,
                         files: list, remote_root: str) -> None:
     """Type each file of a cloned repository into the remote editor."""
@@ -190,6 +253,10 @@ async def type_codebase(client: RdpClient, args: argparse.Namespace,
         # a moment to bring the file up.
         launch = profile["launch_repeat"].format(path=remote_path)
         wait = editor_wait if index == 1 else profile["relaunch_wait"]
+        # Log what goes into the Run dialog: it is fire-and-forget, so this is
+        # the only record of what was actually asked for if a launch fails.
+        if index == 1:
+            print(f"      Win+R, then: {launch}")
         await run_via_run_dialog(sender, launch, args.dialog_wait)
         await _settle(wait)
 
@@ -414,5 +481,5 @@ def main(argv: list[str] | None = None) -> int:
 if __name__ == "__main__":
     raise SystemExit(
         "demo.py is part of the application, not an entry point. "
-        "Start it from the GUI instead:  python gui.py"
+        "Start it with:  python gui.py   (desktop)  or  python cli.py   (server)"
     )

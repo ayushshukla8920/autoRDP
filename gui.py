@@ -681,60 +681,13 @@ class RunnerWindow:
         print("\nDemo finished.")
 
     def _run_codebase(self) -> None:
-        """Clone the repository, pick what fits the budget, then type it."""
+        """Clone the repository and type it, all on the shared code path."""
         editor = "code" if self.action == "repo-code" else "notepad"
         args = demo.parse_args(["--editor", editor])
-        profile = demo.EDITORS[editor]
         # 0 (or blank) in the form means no limit: type the whole repository.
         budget = float(self.options.get("budget") or 0) * 60.0
-        url = self.options["repo"]
-
-        print(f"[1] Cloning {url}")
-        checkout = codebase.clone(url)
-        print(f"    into {checkout}")
-
-        print("[2] Selecting files")
-        files, skipped = codebase.collect(checkout)
-        if not files:
-            raise codebase.CodebaseError(
-                "No typable source files found. The repository may contain only "
-                "binaries, very large files, or unsupported extensions.")
-        total_chars = sum(f.characters for f in files)
-        print(f"    {len(files)} candidate file(s), {total_chars:,} characters")
-        if skipped:
-            print(f"    {len(skipped)} skipped, first few:")
-            for line in skipped[:5]:
-                print(f"      - {line}")
-
-        chosen, dropped, estimate = codebase.plan(
-            files, self.settings, profile["editor_safe"], budget)
-        print(f"\n[3] Typing runs at roughly 20-25 characters a second, so the "
-              f"whole repository would take "
-              f"{codebase.human_time(sum(codebase.seconds_for(f, self.settings, profile['editor_safe']) for f in files))}.")
-        if budget > 0:
-            print(f"    Budget is {budget / 60:.0f} min: typing {len(chosen)} file(s), "
-                  f"about {codebase.human_time(estimate)}.")
-        else:
-            print(f"    No budget set: typing all {len(chosen)} file(s), "
-                  f"about {codebase.human_time(estimate)}.")
-        if dropped:
-            print(f"    {len(dropped)} file(s) left out; raise the budget "
-                  f"(or set it to 0) to include more.")
-
-        print(f"\n[4] Connecting to {self.settings.target}")
-        self.loop.run(self.client.connect())
-        print("    Connected successfully")
-        self.settings.remember(remember_password=False)
-
-        print("[5] Waiting for the remote desktop to finish starting up")
-        settled = self.loop.run(
-            self.client.wait_for_desktop(timeout=args.startup_timeout))
-        print("    desktop has settled" if settled
-              else "    gave up waiting; continuing on the configured delays")
-
-        remote_root = f"{args.remote_dir.rstrip(chr(92))}\\{codebase.slug(url)}"
-        print(f"[6] Typing into {remote_root}\n")
-        self.loop.run(demo.type_codebase(self.client, args, chosen, remote_root))
+        self.loop.run(demo.run_codebase_session(
+            self.client, args, self.options["repo"], budget))
 
     def _run_interactive(self) -> None:
         print(f"Connecting to {self.settings.target} ...")
