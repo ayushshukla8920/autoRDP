@@ -21,14 +21,12 @@ import getpass
 import os
 import sys
 
-import codebase
-import credentials
-import demo
-import main as main_module
-from config import ConfigError, Settings, setup_logging
-from input_events import EmergencyStopped, InputError, SessionNotAcceptingInput
-from main import LoopThread
-from rdp_client import ConnectionFailed, RdpClient
+from rdpauto import codebase, console, credentials, session
+from rdpauto.config import ConfigError, Settings, setup_logging
+from rdpauto.console import LoopThread
+from rdpauto.input_events import (EmergencyStopped, InputError,
+                                  SessionNotAcceptingInput)
+from rdpauto.rdp_client import ConnectionFailed, RdpClient
 
 ACTIONS = {
     "1": ("test", "Connection test        - an interactive rdp> prompt"),
@@ -133,12 +131,12 @@ def run(action: str, settings: Settings, args: argparse.Namespace) -> int:
         client.stop.reset()
 
     editor = "code" if action.endswith("-code") else "notepad"
-    demo_args = demo.parse_args(["--editor", editor]
+    run_args = session.parse_args(["--editor", editor]
                                 + (["--remember"] if args.remember else [])
                                 + (["--run"] if args.run else [])
                                 + (["--no-screenshots"] if not args.screenshots else []))
     if args.seed is not None:
-        demo_args.seed = args.seed
+        run_args.seed = args.seed
 
     print(f"\nEmergency stop: create {settings.stop_file}, or press Ctrl+C\n")
 
@@ -153,13 +151,13 @@ def run(action: str, settings: Settings, args: argparse.Namespace) -> int:
             settings.remember(remember_password=args.remember)
             print(f"Remote screen: {settings.width}x{settings.height}")
             print("Type 'help' for commands.\n")
-            return main_module.repl(loop, client, settings)
+            return console.repl(loop, client, settings)
 
         if action.startswith("repo"):
-            loop.run(demo.run_codebase_session(
-                client, demo_args, args.repo, args.minutes * 60.0), on_interrupt=trip)
+            loop.run(session.run_codebase_session(
+                client, run_args, args.repo, args.minutes * 60.0), on_interrupt=trip)
         else:
-            loop.run(demo.run_session(client, demo_args), on_interrupt=trip)
+            loop.run(session.run_session(client, run_args), on_interrupt=trip)
         print("\nFinished.")
         return 0
 

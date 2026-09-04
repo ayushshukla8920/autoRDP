@@ -5,8 +5,9 @@ Two modes:
     python gui.py           # connection form, then a log window that runs it
     python gui.py --stop    # a floating STOP button, nothing else
 
-This is the only entry point: main.py, demo.py and the rest are modules of the
-application and refuse to run on their own.
+One of two entry points -- cli.py is the other, for machines with no display.
+Everything under rdpauto/ is a module of the application and refuses to run on
+its own.
 
 The form picks one of five actions -- an interactive connection test, the
 generated-code editor demo, or typing a cloned git repository -- and the runner
@@ -30,14 +31,12 @@ from tkinter import messagebox, ttk
 
 from PIL import Image, ImageTk
 
-import codebase
-import credentials
-import demo
-import main as main_module
-from config import PROJECT_ROOT, Settings, setup_logging
-from input_events import EmergencyStopped, InputError, SessionNotAcceptingInput
-from main import LoopThread
-from rdp_client import ConnectionFailed, RdpClient
+from rdpauto import codebase, console, credentials, session
+from rdpauto.config import PROJECT_ROOT, Settings, setup_logging
+from rdpauto.console import LoopThread
+from rdpauto.input_events import (EmergencyStopped, InputError,
+                                  SessionNotAcceptingInput)
+from rdpauto.rdp_client import ConnectionFailed, RdpClient
 
 PAD = {"padx": 8, "pady": 4}
 
@@ -113,11 +112,11 @@ class ConnectionForm:
             ttk.Label(frame, text="Then run").grid(row=row, column=0, sticky="w", **PAD)
             box = ttk.Frame(frame)
             box.grid(row=row, column=1, sticky="w")
-            ttk.Radiobutton(box, text="Connection test (main.py)",
+            ttk.Radiobutton(box, text="Connection test",
                             variable=self.action, value="test").grid(sticky="w")
-            ttk.Radiobutton(box, text="Editor demo, Notepad (demo.py)",
+            ttk.Radiobutton(box, text="Editor demo, Notepad",
                             variable=self.action, value="demo-notepad").grid(sticky="w")
-            ttk.Radiobutton(box, text="Editor demo, VS Code (demo.py)",
+            ttk.Radiobutton(box, text="Editor demo, VS Code",
                             variable=self.action, value="demo-code").grid(sticky="w")
             ttk.Radiobutton(box, text="Type a codebase, Notepad",
                             variable=self.action, value="repo-notepad").grid(sticky="w")
@@ -288,7 +287,7 @@ class _QueueWriter:
     """A text stream that captures one thread's output into a queue.
 
     ``sys.stdout`` and ``sys.stderr`` are pointed at this while a run is
-    active, so the ``print`` calls in demo.py and main.py's command handlers
+    active, so the ``print`` calls in session.py and main.py's command handlers
     land in the log pane unchanged. Logging is configured afterwards, so its
     StreamHandler picks up the redirected stderr and comes along too.
 
@@ -676,17 +675,17 @@ class RunnerWindow:
 
     def _run_demo(self) -> None:
         editor = "code" if self.action == "demo-code" else "notepad"
-        args = demo.parse_args(["--editor", editor])
-        self.loop.run(demo.run_session(self.client, args))
+        args = session.parse_args(["--editor", editor])
+        self.loop.run(session.run_session(self.client, args))
         print("\nDemo finished.")
 
     def _run_codebase(self) -> None:
         """Clone the repository and type it, all on the shared code path."""
         editor = "code" if self.action == "repo-code" else "notepad"
-        args = demo.parse_args(["--editor", editor])
+        args = session.parse_args(["--editor", editor])
         # 0 (or blank) in the form means no limit: type the whole repository.
         budget = float(self.options.get("budget") or 0) * 60.0
-        self.loop.run(demo.run_codebase_session(
+        self.loop.run(session.run_codebase_session(
             self.client, args, self.options["repo"], budget))
 
     def _run_interactive(self) -> None:
@@ -710,7 +709,7 @@ class RunnerWindow:
                 print("The RDP session has disconnected.")
                 return
             try:
-                if not main_module.dispatch(self.loop, self.client, self.settings,
+                if not console.dispatch(self.loop, self.client, self.settings,
                                            command, argument.strip(), line):
                     print(f"Unknown command {command!r}. Type 'help' for the list.")
             except EmergencyStopped as exc:

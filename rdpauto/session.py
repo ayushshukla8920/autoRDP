@@ -1,8 +1,9 @@
-"""Phase 2: open an editor in the remote session and type a generated file into it.
+"""The session flows both front ends drive.
 
-    python demo.py                  # Notepad, type and save, do not run
-    python demo.py --editor code    # VS Code instead
-    python demo.py --run            # also execute the file afterwards
+``run_session`` types a generated file into one editor; ``run_codebase_session``
+clones a repository and types its files. Both connect, wait for the remote
+shell, and report progress with ``print`` so the console and the GUI log pane
+show the same thing. Disconnecting is left to the caller.
 
 The whole sequence runs inside the RDP session this process opened. The local
 desktop is never touched.
@@ -17,12 +18,12 @@ import sys
 import time
 from datetime import datetime
 
-import codebase
-from code_generator import generate
-from config import ConfigError, Settings, setup_logging
-from input_events import EmergencyStopped, InputError, SessionNotAcceptingInput
-from main import LoopThread
-from rdp_client import ConnectionFailed, RdpClient
+from . import codebase
+from .code_generator import generate
+from .config import Settings
+from .input_events import EmergencyStopped, InputError, SessionNotAcceptingInput
+from .console import LoopThread
+from .rdp_client import ConnectionFailed, RdpClient
 
 DEFAULT_REMOTE_DIR = r"C:\Users\Public\Documents"
 
@@ -480,6 +481,6 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(
-        "demo.py is part of the application, not an entry point. "
+        "rdpauto/session.py is part of the application, not an entry point. "
         "Start it with:  python gui.py   (desktop)  or  python cli.py   (server)"
     )

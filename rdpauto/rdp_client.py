@@ -17,8 +17,8 @@ from aardwolf.commons.factory import RDPConnectionFactory
 from aardwolf.commons.iosettings import RDPIOSettings
 from aardwolf.commons.queuedata.constants import VIDEO_FORMAT
 
-from config import Settings
-from input_events import EmergencyStop, InputSender, SessionNotAcceptingInput
+from .config import Settings
+from .input_events import EmergencyStop, InputSender, SessionNotAcceptingInput
 
 logger = logging.getLogger("rdpauto.client")
 

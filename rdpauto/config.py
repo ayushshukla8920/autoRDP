@@ -20,9 +20,24 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
-import credentials
+from . import credentials
 
-PROJECT_ROOT = Path(__file__).resolve().parent
+def _project_root() -> Path:
+    """Where writable state (screenshots, the STOP file) belongs.
+
+    In a PyInstaller one-file build ``__file__`` points inside a temporary
+    extraction directory that is deleted when the process exits, so anchoring
+    to it would put the STOP file and the screenshots somewhere that vanishes
+    -- and the emergency stop would silently never be seen. Next to the
+    executable is both persistent and where a user would look.
+    """
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    # This module lives in rdpauto/, so the project root is its parent.
+    return Path(__file__).resolve().parent.parent
+
+
+PROJECT_ROOT = _project_root()
 
 logger = logging.getLogger("rdpauto.config")
 

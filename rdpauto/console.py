@@ -19,10 +19,10 @@ import threading
 import time
 from pathlib import Path
 
-import credentials
-from config import ConfigError, Settings, setup_logging
-from input_events import EmergencyStopped, InputError, SessionNotAcceptingInput
-from rdp_client import ConnectionFailed, RdpClient
+from . import credentials
+from .config import ConfigError, Settings, setup_logging
+from .input_events import EmergencyStopped, InputError, SessionNotAcceptingInput
+from .rdp_client import ConnectionFailed, RdpClient
 
 HELP = """
 Commands
@@ -223,7 +223,7 @@ def dispatch(loop: LoopThread, client: RdpClient, settings: Settings,
         print(HELP)
 
     elif command == "keys":
-        from input_events import KEY_ALIASES
+        from .input_events import KEY_ALIASES
         names = sorted(KEY_ALIASES)
         for i in range(0, len(names), 6):
             print("  " + "  ".join(f"{n:<12}" for n in names[i:i + 6]))
@@ -339,6 +339,6 @@ def _coords(raw_x: str, raw_y: str, settings: Settings) -> tuple[int, int]:
 
 if __name__ == "__main__":
     raise SystemExit(
-        "main.py is part of the application, not an entry point. "
+        "rdpauto/console.py is part of the application, not an entry point. "
         "Start it with:  python gui.py   (desktop)  or  python cli.py   (server)"
     )

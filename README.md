@@ -152,7 +152,7 @@ and remembers them (see [section 12](#13-configuration)).
 Verify the install without touching the network:
 
 ```powershell
-python -c "import aardwolf, input_events, rdp_client, codebase, gui; print('ok')"
+python -c "import gui, cli; print('ok')"
 ```
 
 ## 7. Enabling RDP on the Windows server
@@ -592,7 +592,7 @@ the server ends the session, or an administrator uses *Log off* / *Disconnect*:
 * `aardwolf` sets `disconnected_evt`, and every subsequent input call raises
   `SessionNotAcceptingInput` with a plain-language message. Nothing is sent into
   the void.
-* `main.py` notices at the prompt and exits; `demo.py` aborts the sequence,
+* the interactive prompt notices and exits; a demo or codebase run aborts,
   reports which step failed, and still disconnects cleanly.
 * Retries apply to *establishing* the connection (`RDP_CONNECT_RETRIES`), not to
   reconnecting mid-run. Reconnecting mid-sequence would resume against unknown
@@ -615,9 +615,10 @@ without waiting for the network:
   ```
   Every input call checks for it (at most every 200 ms) and refuses to send.
   Delete it, or run `resume`, to continue.
-* **Press Ctrl+C.** In `main.py` this aborts the running command and keeps the
-  session; press it at the prompt to quit. In `demo.py` it aborts the sequence
-  and disconnects cleanly. Modifier keys held down mid-chord are always released
+* **Press Ctrl+C**, or use the runner window's STOP button. At an interactive
+  prompt this aborts the running command and keeps the session; press it again
+  to quit. During a demo or codebase run it aborts the sequence and disconnects
+  cleanly. Modifier keys held down mid-chord are always released
   on the way out, so the remote session is never left with a stuck `Ctrl`.
 
 Both are local and synchronous: they stop this process from *sending*, so they
@@ -821,30 +822,138 @@ runner window — closing it trips the stop and disconnects cleanly.
 Run with `RDP_LOG_LEVEL=DEBUG` for protocol-level detail, and
 `RDP_LOG_FILE=run.log` to keep it.
 
-## 16. Project layout
+## 16. Building autoRDP.exe
+
+```powershell
+.\build.ps1                  # single autoRDP.exe in dist\
+.\build.ps1 -OneDir          # a folder that starts far faster
+.\build.ps1 -Clean           # after changing the spec or a dependency
+```
+
+The script creates the virtual environment if missing, installs dependencies,
+regenerates the icon when `assets/icon-source.png` has changed, builds, and then
+**launches the exe to confirm it opens a window**.
+
+`autoRDP.exe` is the **GUI only**. The spec's entry point is `gui.py`, so
+`cli.py` is unreachable and PyInstaller does not bundle it — the packaged
+first-party modules are `gui` plus the `rdpauto` package, nothing else. On a
+server you run `cli.py` from a checkout rather than from the exe, which is the
+right shape anyway: a headless box has no display for the window the exe opens.
+
+That last step earns its keep. A PyInstaller build can succeed and still produce
+an exe that dies on startup, because this dependency tree imports things
+dynamically and static analysis cannot see them. Two such bugs were found this
+way and are now handled in `autoRDP.spec`:
+
+* `aardwolf` loads keyboard layouts with
+  `importlib.import_module('aardwolf.keyboard.layouts.layout_KBDUSX')`. Without
+  `collect_submodules`, the app starts, connects, and then fails on the first
+  keystroke with *Unknown keyboard layout 'enus'*.
+* `unicrypto` picks its crypto backend at import time, reaching
+  `Cryptodome.Util.Counter`. Without `Cryptodome` collected, the exe dies before
+  the window appears.
+
+A third trap is in the app rather than the spec: `PROJECT_ROOT` normally comes
+from `__file__`, which in a one-file bundle points inside a temporary directory
+that is deleted on exit. `config._project_root()` detects `sys.frozen` and
+anchors to the executable instead, so the STOP file and `screenshots\` stay
+next to the exe — a stop file written into a vanishing temp directory would
+never be seen.
+
+| | One file | One folder |
+|---|---|---|
+| Ship | a single 32 MB `autoRDP.exe` | the whole `dist\autoRDP\` folder (66 MB) |
+| Time to window | **~12 s** | **~1 s** |
+| Why | unpacks the whole archive to a temp directory on every launch | nothing to unpack |
+
+Those figures are measured, not estimated: three launches each, timing from
+`Start-Process` until the window has a title. One-file averaged 12.0 s
+(13.9 / 11.0 / 11.2) and one-folder 1.1 s (1.2 / 0.9 / 1.1). The build script's
+own smoke test tends to report a friendlier number for one-file, because it
+runs immediately after the build while the archive is still hot in the disk
+cache — treat 12 s as the number a user will actually see.
+
+### Reading the build output
+
+The script keeps PyInstaller quiet. Its output goes to
+`build" + BS + "pyinstaller-err.log` and only a count reaches the screen:
+
+```
+[4] Building
+    6 benign warning(s) from dependencies, logged to build\pyinstaller-err.log
+```
+
+Those six are the same every time, and none of them is actionable:
+
+* `unicrypto.backends.pycryptodomex` cannot be introspected because of a
+  circular import inside it (twice). The modules are still collected via
+  `Cryptodome`, which the self-check confirmed at runtime.
+* `arc4` is a single C extension module rather than a package, so there is no
+  package data or DLL directory to walk (twice).
+* `pycparser.lextab` / `yacctab` do not exist on disk -- cffi generates them at
+  runtime.
+
+`PYTHONWARNINGS=ignore` is set for the build, which also removes the dozens of
+`UserWarning` lines that `Cryptodome`'s self-test suite emits merely from being
+imported during analysis. If PyInstaller ever does fail, the script prints the
+last 25 log lines and the log path instead of a bare error.
+
+**Both builds take about the same time to produce** (~40 s), and `-Clean` costs
+nothing measurable here (40 s either way). PyInstaller re-runs its analysis on
+every build regardless, and for this project that analysis plus writing the
+archive dominates, so the cache it keeps in `build/` saves very little. Use
+`-Clean` freely.
+
+`ONEFILE` at the top of `autoRDP.spec` is the switch; `-OneDir` flips it without
+touching the tracked file. UPX compression is deliberately off — it roughly
+doubles the rate at which antivirus flags a PyInstaller exe.
+
+Put the exe somewhere writable. It keeps `STOP` and `screenshots\` beside
+itself, which will not work under `C:\Program Files`.
+
+## 17. Project layout
 
 ```
 rdp-background-automation/
-├── gui.py             # ENTRY POINT (desktop): form, runner window, live view
-├── cli.py             # ENTRY POINT (server): menu and flags, no tkinter
-├── main.py            # command dispatch and the asyncio loop thread
-├── demo.py            # editor profiles, the generated-file demo, codebase typing
-├── codebase.py        # git clone, file selection, time budgeting
-├── rdp_client.py      # connection lifecycle: connect, retry, screenshot, disconnect
-├── input_events.py    # keyboard/mouse RDP input events, emergency stop
-├── code_generator.py  # generates the harmless Python module the demo types
-├── config.py          # settings resolution, secure password prompt, logging
-├── credentials.py     # remembers connection details; DPAPI-encrypts the password
+├── gui.py               ENTRY POINT - desktop: form, runner window, live view
+├── cli.py               ENTRY POINT - server: menu and flags, never loads tkinter
+├── build.ps1            ENTRY POINT - one-click release build
+│
+├── rdpauto/             the application; nothing here runs on its own
+│   ├── config.py        settings resolution, secure password prompt, logging
+│   ├── credentials.py   remembers the connection, DPAPI-encrypts the password
+│   ├── input_events.py  keyboard/mouse RDP input events, emergency stop
+│   ├── rdp_client.py    connect, retry, screenshot, live frames, disconnect
+│   ├── console.py       command dispatch and the asyncio loop thread
+│   ├── session.py       editor profiles and the flows both front ends run
+│   ├── codebase.py      git clone, file selection, time budgeting
+│   └── code_generator.py   the harmless Python module the demo types
+│
+├── assets/
+│   ├── icon-source.png  the original artwork
+│   ├── autoRDP.ico      generated by make_icon.py, embedded in the exe
+│   └── autoRDP-256.png  generated too, handy for docs and shortcuts
+│
+├── autoRDP.spec         PyInstaller recipe (ONEFILE switch at the top)
+├── make_icon.py         keys the white background out of the artwork
 ├── requirements.txt
 ├── .gitignore
 └── README.md
 ```
 
-Only `gui.py` and `cli.py` are runnable; the others raise a message pointing at
-them. The two front ends are thin — they collect settings and call the same
-shared coroutines — so there is no second implementation to keep in step.
+Three entry points, one package. Everything under `rdpauto/` refuses to run
+directly and says which entry point to use instead. The two front ends are
+thin — they collect settings and call the same shared coroutines
+(`session.run_session`, `session.run_codebase_session`, `console.dispatch`) — so
+there is no second implementation to keep in step.
 
-## 17. Scope
+Two modules were renamed when the package was introduced, because their names
+had stopped being true: `main.py` was never the entry point (it holds the
+command dispatch) and `demo.py` had grown past the demo into the shared session
+flows. They are `console.py` and `session.py` now.
+
+
+## 18. Scope
 
 This drives machines you administer, from an account you own, for GUI
 automation and testing. It needs valid credentials and a server configured to
