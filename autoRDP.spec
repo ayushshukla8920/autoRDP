@@ -1,8 +1,9 @@
 # PyInstaller spec for autoRDP.exe -- the windowed GUI build.
 #
-# The entry point is gui.py only, so cli.py is unreachable and is not bundled:
-# the packaged first-party modules are `gui` plus the `rdpauto` package. On a
-# headless server you run cli.py from a checkout instead.
+# The entry point is pyinstaller_entry.py (which calls rdpauto.gui.main), so the
+# console `rdpauto.cli` is unreachable and not bundled: the packaged first-party
+# code is the `rdpauto` package under src/. On a headless server you run
+# `python -m rdpauto.cli` from a checkout instead.
 #
 #   .\.venv\Scripts\python.exe -m PyInstaller autoRDP.spec --noconfirm
 #
@@ -65,9 +66,13 @@ datas = [d for d in datas
 # Imported at runtime by our own code rather than at module scope.
 hiddenimports += ["PIL.ImageTk", "PIL._tkinter_finder"]
 
+# The logo PNG the tkinter windows load at runtime (the titlebar .ico is set
+# separately below, via the `icon=` option).
+datas += [("assets/autoRDP-256.png", "assets")]
+
 analysis = Analysis(
-    ["gui.py"],
-    pathex=[],
+    ["pyinstaller_entry.py"],
+    pathex=["src"],
     binaries=binaries,
     datas=datas,
     hiddenimports=hiddenimports,
@@ -78,7 +83,10 @@ analysis = Analysis(
     # scope, so excluding it breaks the build with ModuleNotFoundError at
     # startup. These four are safe: they are test suites and sample code that
     # collect_all drags in, and nothing here imports them.
-    excludes=["pydoc_data", "tkinter.test"],
+    # A few test suites / build tooling that no runtime path imports. Kept
+    # conservative: `unittest`, `distutils` and `setuptools` are pulled in by
+    # pyparsing/cryptography and excluding them breaks the build.
+    excludes=["pydoc_data", "tkinter.test", "unittest.test", "lib2to3"],
     noarchive=False,
 )
 

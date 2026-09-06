@@ -33,13 +33,42 @@ def _project_root() -> Path:
     """
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
-    # This module lives in rdpauto/, so the project root is its parent.
-    return Path(__file__).resolve().parent.parent
+    # This module lives in src/rdpauto/, so the repo root is two levels up.
+    return Path(__file__).resolve().parents[2]
 
 
 PROJECT_ROOT = _project_root()
 
 logger = logging.getLogger("rdpauto.config")
+
+
+def load_dotenv(path: Path | None = None) -> None:
+    """Load ``KEY=value`` lines from a ``.env`` file into ``os.environ``.
+
+    Real environment variables always win, so a value already set is left
+    alone -- the file only fills in what is missing. This is where secrets like
+    ``RDP_TELEGRAM_TOKEN`` live, kept out of the saved profile and out of git.
+    """
+    env_path = Path(path) if path else PROJECT_ROOT / ".env"
+    if not env_path.exists():
+        return
+    try:
+        text = env_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        logger.warning("Could not read %s: %s", env_path, exc)
+        return
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+load_dotenv()
 
 
 class ConfigError(Exception):
@@ -91,6 +120,13 @@ class Settings:
     connect_timeout: float = 20.0
     connect_retries: int = 3
     retry_delay: float = 3.0
+    reconnect_attempts: int = 3   # mid-run reconnect tries after a dropped session
+    reconnect_delay: float = 5.0
+    stall_timeout: float = 45.0   # frozen-screen seconds before treating typing as stalled (0 = off)
+
+    # --- telegram alerts (env/.env only, never saved to the profile) ---
+    telegram_token: str = field(default="", repr=False)
+    telegram_chat_id: str = ""
 
     # --- input pacing ---
     char_delay: float = 0.012   # between characters of `type`
@@ -122,7 +158,9 @@ class Settings:
         return f"{who}@{self.host}:{self.port}"
 
     def as_profile(self) -> dict[str, str]:
-        """The subset worth remembering for next time."""
+        """The non-secret details worth remembering. Secrets (password, Telegram
+        token) are added by :meth:`remember` only when asked -- keeping them out
+        here is what stops a plain ``remember()`` from wiping a saved password."""
         return {
             "host": self.host,
             "port": str(self.port),
@@ -130,12 +168,18 @@ class Settings:
             "domain": self.domain,
             "width": str(self.width),
             "height": str(self.height),
-            "password": self.password,
+            "telegram_chat_id": self.telegram_chat_id,
         }
 
     def remember(self, remember_password: bool = False) -> Path | None:
-        """Save these details as the profile for next time."""
-        return credentials.save(self.as_profile(), remember_password=remember_password)
+        """Save these details. Secrets are included only when
+        ``remember_password`` is set, so an ordinary post-connect ``remember()``
+        never touches (or clears) an already-saved password or token."""
+        profile = self.as_profile()
+        if remember_password:
+            profile["password"] = self.password
+            profile["telegram_token"] = self.telegram_token
+        return credentials.save(profile, remember_password=remember_password)
 
     @classmethod
     def load(cls, interactive: bool = True) -> "Settings":
@@ -156,7 +200,7 @@ class Settings:
                 where = credentials.profile_path()
                 print(f"Using remembered details from {where}")
                 print("  (press Enter to accept a remembered value; "
-                      "`python gui.py` to edit them, `--forget` to clear)")
+                      "`python -m rdpauto.gui` to edit them, `--forget` to clear)")
             host = host or _ask("RDP host/IP", required=True)
             username = username or _ask("Username", required=True)
             if not domain:
@@ -172,7 +216,7 @@ class Settings:
             if not password:
                 raise ConfigError(
                     "No password available. Set RDP_PASSWORD, save one with "
-                    "`python gui.py`, or run interactively.")
+                    "`python -m rdpauto.gui`, or run interactively.")
 
         try:
             port = int(port_raw or 3389)
@@ -201,6 +245,11 @@ class Settings:
             connect_timeout=_env_float("RDP_CONNECT_TIMEOUT", 20.0),
             connect_retries=_env_int("RDP_CONNECT_RETRIES", 3),
             retry_delay=_env_float("RDP_RETRY_DELAY", 3.0),
+            reconnect_attempts=_env_int("RDP_RECONNECT_ATTEMPTS", 3),
+            reconnect_delay=_env_float("RDP_RECONNECT_DELAY", 5.0),
+            stall_timeout=_env_float("RDP_STALL_TIMEOUT", 45.0),
+            telegram_token=_env("RDP_TELEGRAM_TOKEN") or saved.get("telegram_token", ""),
+            telegram_chat_id=_env("RDP_TELEGRAM_CHAT_ID") or saved.get("telegram_chat_id", ""),
             char_delay=_env_float("RDP_CHAR_DELAY", 0.012),
             key_delay=_env_float("RDP_KEY_DELAY", 0.03),
             action_delay=_env_float("RDP_ACTION_DELAY", 0.25),

@@ -36,6 +36,12 @@ class SessionNotAcceptingInput(InputError):
     """The RDP session is gone, so input cannot be delivered."""
 
 
+class SessionStalled(SessionNotAcceptingInput):
+    """The connection is alive but the remote stopped responding (frozen
+    desktop). A subclass so the reconnect handler treats it like a lost
+    session -- reconnecting usually revives a wedged remote."""
+
+
 class EmergencyStopped(InputError):
     """The local emergency stop was tripped."""
 
@@ -114,51 +120,102 @@ BUTTONS = {
 
 
 class EmergencyStop:
-    """Local kill switch for outgoing input.
+    """Two-level stop switch for outgoing input.
 
-    Trips when either the in-process flag is set (Ctrl+C, or an explicit call)
-    or a sentinel file appears on the local disk. The file is stat'd at most
-    every ``poll_interval`` seconds so per-character typing stays cheap.
+    * **Pause** (STOP button, or the sentinel file) suspends typing while
+      keeping the session connected. Typing parks at the next character and
+      continues from there when resumed -- nothing is lost, nothing disconnects.
+    * **Abort** (window close, Ctrl+C) unwinds the run for good and lets the
+      caller disconnect.
+
+    The sentinel file is stat'd at most every ``poll_interval`` seconds so
+    per-character typing stays cheap.
     """
 
     def __init__(self, stop_file: Path, poll_interval: float = 0.2) -> None:
         self.stop_file = Path(stop_file)
         self.poll_interval = poll_interval
-        self._tripped = False
+        self._aborted = False
+        self._paused = False
         self._reason = ""
         self._last_poll = 0.0
+        self._file_present = False
 
-    def trip(self, reason: str = "requested locally") -> None:
-        if not self._tripped:
-            self._tripped = True
+    # ---- pause (resumable) ----
+    def pause(self, reason: str = "paused") -> None:
+        if not self._paused:
+            self._paused = True
+            self._reason = reason
+            logger.info("Paused: %s", reason)
+
+    def resume(self) -> None:
+        """Lift a pause and clear the sentinel file, so typing continues."""
+        self._paused = False
+        self._last_poll = 0.0
+        self._file_present = False
+        try:
+            self.stop_file.unlink(missing_ok=True)
+        except OSError as exc:
+            logger.warning("Could not remove stop file %s: %s", self.stop_file, exc)
+        logger.info("Resumed")
+
+    # ---- abort (final) ----
+    def abort(self, reason: str = "requested locally") -> None:
+        if not self._aborted:
+            self._aborted = True
             self._reason = reason
             logger.warning("EMERGENCY STOP: %s", reason)
 
+    # Alias kept for the abort callers (Ctrl+C, window close).
+    def trip(self, reason: str = "requested locally") -> None:
+        self.abort(reason)
+
     def reset(self) -> None:
-        """Clear the flag and remove the sentinel file, so work can resume."""
-        self._tripped = False
+        """Clear everything (pause and abort) and remove the sentinel file."""
+        self._aborted = False
+        self._paused = False
         self._reason = ""
         self._last_poll = 0.0
+        self._file_present = False
         try:
             self.stop_file.unlink(missing_ok=True)
         except OSError as exc:
             logger.warning("Could not remove stop file %s: %s", self.stop_file, exc)
 
-    @property
-    def tripped(self) -> bool:
-        if self._tripped:
-            return True
+    def _sentinel_present(self) -> bool:
         now = time.monotonic()
         if now - self._last_poll >= self.poll_interval:
             self._last_poll = now
-            if self.stop_file.exists():
-                self.trip(f"stop file present: {self.stop_file}")
-        return self._tripped
+            self._file_present = self.stop_file.exists()
+        return self._file_present
+
+    @property
+    def paused(self) -> bool:
+        return self._paused or self._sentinel_present()
+
+    @property
+    def aborted(self) -> bool:
+        return self._aborted
+
+    @property
+    def tripped(self) -> bool:
+        """Backwards-compatible 'stopped in any way' (paused or aborted)."""
+        return self._aborted or self.paused
 
     def check(self) -> None:
-        if self.tripped:
-            raise EmergencyStopped(f"Emergency stop active ({self._reason}). "
-                                   f"Delete {self.stop_file} and reconnect to resume.")
+        """Raise on abort only. Pausing does not raise -- typing waits instead
+        (see :meth:`gate`), so a pause never tears the run down."""
+        if self._aborted:
+            raise EmergencyStopped(f"Aborted ({self._reason}).")
+
+    async def gate(self) -> None:
+        """Await here between keystrokes: raise on abort, block while paused."""
+        if self._aborted:
+            raise EmergencyStopped(f"Aborted ({self._reason}).")
+        while self.paused:
+            await asyncio.sleep(self.poll_interval)
+            if self._aborted:
+                raise EmergencyStopped(f"Aborted ({self._reason}).")
 
 
 class InputSender:
@@ -296,7 +353,7 @@ class InputSender:
         sent as a keystroke for that character.
         """
         for char in text:
-            self._stop.check()
+            await self._stop.gate()
             if char == "\r":
                 continue  # CRLF: the \n does the work
             if char == "\n":
@@ -373,7 +430,7 @@ class InputSender:
         """
         lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
         for index, line in enumerate(lines):
-            self._stop.check()
+            await self._stop.gate()
             if editor_safe:
                 await self.key("HOME")
                 await self.chord("shift+END")
@@ -381,7 +438,7 @@ class InputSender:
                     # Selection (if any) must still be cleared on a blank line.
                     await self.key("DELETE")
             for char in line:
-                self._stop.check()
+                await self._stop.gate()
                 if char == "\t":
                     await self.key("TAB")
                     continue

@@ -129,5 +129,5 @@ def generate(seed: int | None = None, how_many: int = 3) -> str:
 if __name__ == "__main__":
     raise SystemExit(
         "rdpauto/code_generator.py is part of the application, not an entry point. "
-        "Start it with:  python gui.py   (desktop)  or  python cli.py   (server)"
+        "Start it with:  python -m rdpauto.gui   (desktop)  or  python -m rdpauto.cli   (server)"
     )

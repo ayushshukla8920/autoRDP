@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "autordp"
+version = "0.2.0"
+description = "RDP input automation over a client-owned session"
+requires-python = ">=3.9"
+dependencies = [
+    # Pinned to 0.2.13: newest release with prebuilt Windows wheels for
+    # CPython 3.9-3.13. 0.2.14 is source-only and needs a Rust toolchain.
+    "aardwolf==0.2.13",
+    # Pillow rides in via aardwolf but is used directly (icons, live view).
+    "pillow",
+]
+
+[project.scripts]
+# After `pip install -e .` these launch from anywhere, no recompile on edits.
+autordp = "rdpauto.cli:main"
+autordp-gui = "rdpauto.gui:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

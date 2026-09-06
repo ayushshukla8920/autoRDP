@@ -30,7 +30,8 @@ except (ImportError, ValueError):  # pragma: no cover - only hit off Windows
 
 logger = logging.getLogger("rdpauto.credentials")
 
-PROFILE_FIELDS = ("host", "port", "username", "domain", "width", "height")
+PROFILE_FIELDS = ("host", "port", "username", "domain", "width", "height",
+                  "telegram_chat_id", "repo")
 
 
 def profile_path() -> Path:
@@ -120,83 +121,156 @@ def unprotect(token: str) -> str | None:
 
 
 # ------------------------------------------------------------------- profile
+#
+# The store keeps one entry per server, keyed by host, plus the last one used:
+#   {"profiles": {"192.168.1.3": {...}, "192.168.1.43": {...}}, "last": "..."}
+# An older single-server file (flat dict with "host" at the top) is migrated
+# into that shape on read, so nothing saved before is lost.
 
-def load() -> dict[str, str]:
-    """Read the saved profile. Returns {} when there is nothing usable."""
+def _read_store() -> dict[str, Any]:
+    """The raw store as ``{"profiles": {...}, "last": host}``, migrating the
+    old single-profile format on the way."""
     path = profile_path()
     if not path.exists():
-        return {}
+        return {"profiles": {}, "last": ""}
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
         logger.warning("Ignoring unreadable profile %s: %s", path, exc)
-        return {}
+        return {"profiles": {}, "last": ""}
     if not isinstance(data, dict):
-        return {}
+        return {"profiles": {}, "last": ""}
+    if "profiles" in data and isinstance(data["profiles"], dict):
+        return data
+    if data.get("host"):                       # legacy flat single profile
+        return {"profiles": {str(data["host"]): data}, "last": str(data["host"])}
+    return {"profiles": {}, "last": ""}
 
-    values = {f: str(data.get(f, "")) for f in PROFILE_FIELDS}
-    token = data.get("password")
-    if token:
-        secret = unprotect(str(token))
+
+def _decrypt(entry: dict[str, Any]) -> dict[str, str]:
+    """Turn one stored entry into plain form values, decrypting the secrets."""
+    values = {f: str(entry.get(f, "")) for f in PROFILE_FIELDS}
+    if entry.get("password"):
+        secret = unprotect(str(entry["password"]))
         if secret is None:
-            logger.warning(
-                "Saved password could not be decrypted (different Windows user or "
-                "machine?). You will be asked for it.")
+            logger.warning("Saved password could not be decrypted (different "
+                           "Windows user or machine?). You will be asked for it.")
         else:
             values["password"] = secret
+    if entry.get("telegram_token"):            # encrypted like the password
+        secret = unprotect(str(entry["telegram_token"]))
+        if secret is not None:
+            values["telegram_token"] = secret
     return {k: v for k, v in values.items() if v}
 
 
-def save(values: dict[str, str], remember_password: bool = False) -> Path | None:
-    """Write the profile. Returns the path, or None if it could not be saved."""
-    path = profile_path()
-    record: dict[str, Any] = {f: str(values.get(f, "") or "") for f in PROFILE_FIELDS}
+def hosts() -> list[str]:
+    """Every saved server's host, newest-used first then the rest sorted."""
+    store = _read_store()
+    names = list(store["profiles"])
+    last = store.get("last")
+    names.sort()
+    if last in names:
+        names.remove(last)
+        names.insert(0, last)
+    return names
 
+
+def load(host: str | None = None) -> dict[str, str]:
+    """Values for ``host``, or the last-used server when host is None. {} if none."""
+    store = _read_store()
+    if host is None:
+        host = store.get("last", "")
+    entry = store["profiles"].get(host or "", {})
+    return _decrypt(entry) if entry else {}
+
+
+def save(values: dict[str, str], remember_password: bool = False) -> Path | None:
+    """Save one server (keyed by its host) and mark it last-used. Merges into
+    that host's existing entry, leaving the other servers untouched."""
+    host = (values.get("host") or "").strip()
+    if not host:
+        logger.warning("No host in the values; nothing saved.")
+        return None
+
+    store = _read_store()
+    entry = store["profiles"].get(host, {})
+    for f in PROFILE_FIELDS:
+        if f in values:
+            entry[f] = str(values.get(f) or "")
+
+    # Password: saved only when the box is ticked; unticking forgets it.
     if remember_password and values.get("password"):
         if not DPAPI_AVAILABLE:
-            logger.warning(
-                "Passwords are only remembered on Windows, where DPAPI can "
-                "encrypt them. Set RDP_PASSWORD instead.")
+            logger.warning("Passwords are only remembered on Windows (DPAPI). "
+                           "Set RDP_PASSWORD instead.")
         else:
             try:
-                record["password"] = protect(values["password"])
+                entry["password"] = protect(values["password"])
             except OSError as exc:
                 logger.warning("Could not encrypt the password, not saving it: %s", exc)
+    elif "password" in values and not remember_password:
+        entry.pop("password", None)
 
+    # Telegram token: saved whenever provided, encrypted; clearing it forgets it.
+    if values.get("telegram_token"):
+        if not DPAPI_AVAILABLE:
+            logger.warning("The Telegram token is only remembered on Windows "
+                           "(DPAPI). Set RDP_TELEGRAM_TOKEN in .env instead.")
+        else:
+            try:
+                entry["telegram_token"] = protect(values["telegram_token"])
+            except OSError as exc:
+                logger.warning("Could not encrypt the Telegram token, not saving it: %s", exc)
+    elif "telegram_token" in values:
+        entry.pop("telegram_token", None)
+
+    store["profiles"][host] = entry
+    store["last"] = host
+
+    path = profile_path()
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(record, indent=2), encoding="utf-8")
+        path.write_text(json.dumps(store, indent=2), encoding="utf-8")
     except OSError as exc:
         logger.warning("Could not save the profile to %s: %s", path, exc)
         return None
-
-    # Best effort: make the file readable only by this user.
     try:
-        os.chmod(path, 0o600)
+        os.chmod(path, 0o600)               # best effort: readable only by this user
     except OSError:
         pass
-    logger.debug("Profile saved to %s", path)
     return path
 
 
-def has_saved_password() -> bool:
-    path = profile_path()
-    if not path.exists():
-        return False
-    try:
-        return bool(json.loads(path.read_text(encoding="utf-8")).get("password"))
-    except (OSError, ValueError):
-        return False
+def has_saved_password(host: str | None = None) -> bool:
+    store = _read_store()
+    if host is None:
+        host = store.get("last", "")
+    return bool(store["profiles"].get(host or "", {}).get("password"))
 
 
-def forget() -> bool:
-    """Delete the saved profile. True if a file was removed."""
+def forget(host: str | None = None) -> bool:
+    """Remove one saved server, or (host=None) delete the whole store."""
     path = profile_path()
-    try:
-        path.unlink()
-        return True
-    except FileNotFoundError:
+    if host is None:
+        try:
+            path.unlink()
+            return True
+        except FileNotFoundError:
+            return False
+        except OSError as exc:
+            logger.warning("Could not delete %s: %s", path, exc)
+            return False
+
+    store = _read_store()
+    if host not in store["profiles"]:
         return False
+    del store["profiles"][host]
+    if store.get("last") == host:
+        store["last"] = next(iter(store["profiles"]), "")
+    try:
+        path.write_text(json.dumps(store, indent=2), encoding="utf-8")
     except OSError as exc:
-        logger.warning("Could not delete %s: %s", path, exc)
+        logger.warning("Could not update %s: %s", path, exc)
         return False
+    return True

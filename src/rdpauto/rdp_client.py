@@ -177,13 +177,25 @@ class RdpClient:
         self.connection = None
         self.input = None
 
-    async def disconnect(self) -> None:
-        """Send a disconnect request and tear everything down."""
+    async def disconnect(self, logoff: bool = False) -> None:
+        """Detach from the session (default) or log it off.
+
+        Default detach just drops the socket, leaving the session cleanly
+        *disconnected* and reconnectable. ``logoff=True`` calls aardwolf's
+        ``terminate()``, which sends an RDP Shutdown Request asking the server
+        to log off -- a logoff that stalls on an app refusing to close (VS Code
+        unsaved tabs, a leftover Run dialog) wedges the session and blocks the
+        next connection, so it is opt-in.
+        """
         if self.connection is None:
             return
-        logger.info("Disconnecting from %s", self.settings.host)
+        logger.info("Disconnecting from %s (%s)", self.settings.host,
+                    "logoff" if logoff else "detach")
         try:
-            await asyncio.wait_for(self.connection.terminate(), timeout=5)
+            if logoff:
+                await asyncio.wait_for(self.connection.terminate(), timeout=5)
+            else:
+                await self._close_socket()
         except asyncio.TimeoutError:
             logger.warning("Server did not acknowledge the disconnect in time")
         except Exception as exc:  # noqa: BLE001
@@ -191,6 +203,20 @@ class RdpClient:
         finally:
             await self._teardown()
             logger.info("Disconnected")
+
+    async def _close_socket(self) -> None:
+        """Close the transport without a Shutdown Request. Reaches the
+        name-mangled ``UniConnection`` aardwolf holds; its reader tasks then
+        raise on the closed socket and exit on their own."""
+        try:
+            self.connection.disconnected_evt.set()
+        except Exception:  # noqa: BLE001
+            pass
+        sock = getattr(self.connection, "_RDPConnection__connection", None)
+        if sock is not None and hasattr(sock, "close"):
+            result = sock.close()
+            if asyncio.iscoroutine(result):
+                await asyncio.wait_for(result, timeout=5)
 
     async def __aenter__(self) -> "RdpClient":
         await self.connect()
@@ -264,6 +290,17 @@ class RdpClient:
         if image is None:
             return None
         return image.convert("L").resize((64, 40)).tobytes()
+
+    # Public aliases for the stall watchdog in session.py.
+    def screen_fingerprint(self) -> bytes | None:
+        return self._desktop_fingerprint()
+
+    @staticmethod
+    def screens_match(a: bytes | None, b: bytes | None) -> bool:
+        """True if two fingerprints are effectively the same frame."""
+        if a is None or b is None:
+            return False
+        return _close_enough(a, b)
 
     async def screenshot(self, path: str | Path | None = None) -> Path:
         """Save the current desktop buffer as a PNG and return its path."""

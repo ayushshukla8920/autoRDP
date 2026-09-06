@@ -18,14 +18,57 @@ import sys
 import time
 from datetime import datetime
 
-from . import codebase
+from . import codebase, notify
 from .code_generator import generate
-from .config import Settings
-from .input_events import EmergencyStopped, InputError, SessionNotAcceptingInput
-from .console import LoopThread
+from .config import ConfigError, Settings, setup_logging
+from .input_events import (EmergencyStopped, InputError, SessionNotAcceptingInput,
+                          SessionStalled)
+from .loop import LoopThread
 from .rdp_client import ConnectionFailed, RdpClient
 
 DEFAULT_REMOTE_DIR = r"C:\Users\Public\Documents"
+
+
+class Progress:
+    """Live counters for a codebase run, for the GUI to draw a progress bar.
+
+    Written on the loop thread, read on the Tk thread; the GIL makes each
+    read/write atomic, which is all a status display needs.
+    """
+
+    def __init__(self) -> None:
+        self.active = False
+        self.total = 0
+        self.done = 0
+        self.current = ""
+        self.current_index = 0
+        self.current_lines = 0
+        self.current_chars = 0
+        self.started = 0.0          # monotonic time typing began
+        self.estimate_total = 0.0   # seconds, from the planner
+        self.phase = "waiting"      # waiting | typing | done
+
+    def begin(self, total: int, estimate: float) -> None:
+        self.total = total
+        self.estimate_total = estimate
+        self.done = 0
+        self.started = time.monotonic()
+        self.active = True
+        self.phase = "typing"
+
+    def elapsed(self) -> float:
+        return (time.monotonic() - self.started) if self.started else 0.0
+
+    def eta_seconds(self) -> float:
+        """Best guess at time remaining. Uses the measured pace once a file has
+        finished; before that, falls back to the planner's estimate."""
+        if not self.active or self.total == 0:
+            return 0.0
+        elapsed = self.elapsed()
+        if self.done > 0:
+            per_file = elapsed / self.done
+            return max(0.0, per_file * (self.total - self.done))
+        return max(0.0, self.estimate_total - elapsed)
 
 
 def default_filename() -> str:
@@ -131,6 +174,117 @@ async def run_via_run_dialog(sender, command: str, settle: float) -> None:
     await sender.key("ENTER")
 
 
+async def reconnect(client: RdpClient, reason: str) -> bool:
+    """Bring a dropped session back up, up to ``reconnect_attempts`` times.
+
+    Returns True once connected and the desktop has settled, False after every
+    attempt fails -- in which case a Telegram alert is fired so the failure is
+    noticed without watching the log. The caller decides what to resume; this
+    only restores the connection.
+    """
+    settings = client.settings
+    print(f"\n    ! session lost ({reason}); attempting to reconnect", flush=True)
+    for attempt in range(1, settings.reconnect_attempts + 1):
+        # Detach (close the old socket) before opening a new one, so no half-open
+        # TCP is left holding the session.
+        await client.disconnect()
+        try:
+            await client.connect()
+            print(f"    reconnected on attempt {attempt}/{settings.reconnect_attempts}")
+            await client.wait_for_desktop(timeout=settings.connect_timeout)
+            await _settle(2.0)
+            return True
+        except ConnectionFailed as exc:
+            print(f"    reconnect {attempt}/{settings.reconnect_attempts} failed: {exc}")
+            if attempt < settings.reconnect_attempts:
+                await asyncio.sleep(settings.reconnect_delay)
+
+    alert = (f"[autoRDP] Session to {settings.target} could not be recovered. "
+             f"{settings.reconnect_attempts} reconnect attempts failed. Reason: {reason}")
+    if notify.send(settings, alert):
+        print("    a Telegram alert was sent about the failed reconnect")
+    else:
+        print("    no Telegram alert sent (not configured, or the send failed)")
+    return False
+
+
+async def _guard_typing(client: RdpClient, factory):
+    """Run a typing coroutine while watching the remote screen.
+
+    Typing changes the screen constantly, so if the desktop fingerprint stops
+    changing for ``stall_timeout`` seconds the remote has frozen even though the
+    socket is still up. We then cancel and raise ``SessionStalled`` -- which the
+    reconnect handler treats like a lost session and revives. ``stall_timeout``
+    <= 0 disables the watchdog.
+    """
+    timeout = client.settings.stall_timeout
+    coro = factory()
+    if timeout <= 0:
+        return await coro
+
+    task = asyncio.create_task(coro)
+    loop = asyncio.get_running_loop()
+    prev = None
+    last_change = loop.time()
+    try:
+        while True:
+            done, _ = await asyncio.wait({task}, timeout=2.0)
+            if done:
+                return task.result()
+            thumb = client.screen_fingerprint()
+            if thumb is not None:
+                if prev is None or not client.screens_match(prev, thumb):
+                    last_change = loop.time()
+                prev = thumb
+            if loop.time() - last_change > timeout:
+                raise SessionStalled(
+                    f"remote screen unchanged for {timeout:.0f}s while typing; "
+                    "the session appears frozen")
+    finally:
+        if not task.done():
+            task.cancel()
+            try:
+                await task
+            except BaseException:  # noqa: BLE001 - already unwinding
+                pass
+
+
+async def with_reconnect(client: RdpClient, make_coro, label: str):
+    """Run ``make_coro()``; if the session drops, reconnect and run it again.
+
+    ``make_coro`` is a zero-arg factory (not a coroutine) so the work can be
+    freshly re-issued after a reconnect -- an already-awaited coroutine cannot
+    be restarted.
+    """
+    while True:
+        try:
+            return await make_coro()
+        except SessionNotAcceptingInput as exc:
+            if await reconnect(client, str(exc)):
+                print(f"    resuming: {label}")
+                continue
+            raise
+
+
+async def _ensure_ready(client: RdpClient, args: argparse.Namespace) -> bool:
+    """Connect and wait for the desktop -- unless the client is already
+    connected, in which case the existing session is reused. Returns True if a
+    fresh connection was made.
+    """
+    if client.is_alive:
+        print("    (reusing the existing connection)")
+        return False
+    print(f"    Connecting to {client.settings.target}")
+    await client.connect()
+    print("    Connected successfully")
+    client.settings.remember(remember_password=args.remember)
+    settled = await client.wait_for_desktop(timeout=args.startup_timeout)
+    print("    desktop has settled" if settled
+          else "    gave up waiting; continuing on the configured delays")
+    await _settle(args.startup_wait)
+    return True
+
+
 async def run_session(client: RdpClient, args: argparse.Namespace) -> None:
     """Connect, wait for the session to be usable, then run the demo.
 
@@ -140,19 +294,8 @@ async def run_session(client: RdpClient, args: argparse.Namespace) -> None:
     """
     settings = client.settings
 
-    step(1, f"Connecting to {settings.target}")
-    await client.connect()
-    print("    Connected successfully")
-    settings.remember(remember_password=args.remember)
-
-    # Nothing may be typed until the shell is up: Win+R is handled by Explorer,
-    # so on a session this young it would simply be dropped. A brand-new
-    # session takes seconds to paint a desktop at all.
-    step(2, "Waiting for the remote desktop to finish starting up")
-    settled = await client.wait_for_desktop(timeout=args.startup_timeout)
-    print("    desktop has settled" if settled
-          else "    gave up waiting; continuing on the configured delays")
-    await _settle(args.startup_wait)
+    step(1, "Preparing the session")
+    await _ensure_ready(client, args)
 
     step(3, "Capturing the initial screen")
     if args.screenshots:
@@ -160,11 +303,12 @@ async def run_session(client: RdpClient, args: argparse.Namespace) -> None:
     else:
         print("    skipped (--no-screenshots)")
 
-    await run_demo(client, args)
+    await with_reconnect(client, lambda: run_demo(client, args), "editor demo")
 
 
 async def run_codebase_session(client: RdpClient, args: argparse.Namespace,
-                               url: str, budget_seconds: float) -> None:
+                               url: str, budget_seconds: float,
+                               progress: "Progress | None" = None) -> None:
     """Clone a repository, pick what fits the budget, connect, and type it.
 
     Shared by both front ends: the GUI runs it on its loop thread, the CLI on
@@ -209,38 +353,35 @@ async def run_codebase_session(client: RdpClient, args: argparse.Namespace,
         print(f"    {len(dropped)} file(s) left out; raise the budget "
               f"(or set it to 0) to include more.")
 
-    step(4, f"Connecting to {settings.target}")
-    await client.connect()
-    print("    Connected successfully")
-    settings.remember(remember_password=args.remember)
+    if progress is not None:
+        progress.begin(len(chosen), estimate)
 
-    step(5, "Waiting for the remote desktop to finish starting up")
-    settled = await client.wait_for_desktop(timeout=args.startup_timeout)
-    print("    desktop has settled" if settled
-          else "    gave up waiting; continuing on the configured delays")
-    await _settle(args.startup_wait)
+    step(4, "Preparing the session")
+    await _ensure_ready(client, args)
 
     remote_root = f"{args.remote_dir.rstrip(chr(92))}\\{codebase.slug(url)}"
     step(6, f"Typing into {remote_root}")
-    await type_codebase(client, args, chosen, remote_root)
+    await type_codebase(client, args, chosen, remote_root, progress)
 
 
 async def type_codebase(client: RdpClient, args: argparse.Namespace,
-                        files: list, remote_root: str) -> None:
+                        files: list, remote_root: str,
+                        progress: "Progress | None" = None) -> None:
     """Type each file of a cloned repository into the remote editor."""
     settings = client.settings
-    sender = client.input
     profile = EDITORS[args.editor]
     editor_wait = args.editor_wait if args.editor_wait is not None else profile["wait"]
     made_dirs: set[str] = set()
     done = 0
 
-    for index, source in enumerate(files, start=1):
+    async def type_one(index: int, source, first_launch: bool) -> None:
+        """Type a single file. Safe to re-run wholesale after a reconnect:
+        it re-launches the editor, clears the buffer, and retypes from scratch.
+        """
+        # Read the sender fresh: a reconnect replaces client.input entirely.
+        sender = client.input
         remote_path = f"{remote_root}\\{source.remote_relative}"
         parent = remote_path.rsplit("\\", 1)[0]
-
-        print(f"\n[{index}/{len(files)}] {source.relative} "
-              f"({source.lines} lines, {source.characters} chars)")
 
         # Notepad's Save As cannot create missing folders, so make them first.
         # VS Code creates them itself when saving, so it needs nothing here.
@@ -253,10 +394,8 @@ async def type_codebase(client: RdpClient, args: argparse.Namespace,
         # command reuses the instance that is already running, so it only needs
         # a moment to bring the file up.
         launch = profile["launch_repeat"].format(path=remote_path)
-        wait = editor_wait if index == 1 else profile["relaunch_wait"]
-        # Log what goes into the Run dialog: it is fire-and-forget, so this is
-        # the only record of what was actually asked for if a launch fails.
-        if index == 1:
+        wait = editor_wait if first_launch else profile["relaunch_wait"]
+        if first_launch:
             print(f"      Win+R, then: {launch}")
         await run_via_run_dialog(sender, launch, args.dialog_wait)
         await _settle(wait)
@@ -269,7 +408,8 @@ async def type_codebase(client: RdpClient, args: argparse.Namespace,
 
         started = time.monotonic()
         with pacing(settings, args.action_delay):
-            await sender.type_lines(source.text, editor_safe=profile["editor_safe"])
+            await _guard_typing(client, lambda: sender.type_lines(
+                source.text, editor_safe=profile["editor_safe"]))
         print(f"      typed in {time.monotonic() - started:.0f}s, saving")
 
         await sender.chord("ctrl+s")
@@ -290,11 +430,29 @@ async def type_codebase(client: RdpClient, args: argparse.Namespace,
             await sender.chord("alt+F4")
             await _settle(1.5)
 
-        done += 1
         if args.screenshots and (index == 1 or index == len(files)):
             await client.screenshot(
                 settings.screenshot_dir / f"codebase-{index:03d}.png")
 
+    for index, source in enumerate(files, start=1):
+        if progress is not None:
+            progress.current = source.relative
+            progress.current_index = index
+            progress.current_lines = source.lines
+            progress.current_chars = source.characters
+        print(f"\n[{index}/{len(files)}] {source.relative} "
+              f"({source.lines} lines, {source.characters} chars)")
+        # A dropped session retypes THIS file from scratch after reconnecting;
+        # each file is self-contained, so nothing half-typed is left behind.
+        await with_reconnect(
+            client, lambda i=index, s=source: type_one(i, s, first_launch=(i == 1)),
+            f"{source.relative}")
+        done += 1
+        if progress is not None:
+            progress.done = done
+
+    if progress is not None:
+        progress.phase = "done"
     print(f"\nTyped {done} file(s) into {remote_root}")
 
 
@@ -333,7 +491,8 @@ async def run_demo(client: RdpClient, args: argparse.Namespace) -> None:
     step(7, f"Typing {line_count} lines into the editor")
     started = time.monotonic()
     with pacing(settings, args.action_delay):
-        await sender.type_lines(source, editor_safe=profile["editor_safe"])
+        await _guard_typing(client, lambda: sender.type_lines(
+            source, editor_safe=profile["editor_safe"]))
     print(f"    typed in {time.monotonic() - started:.1f}s")
 
     if profile["save_as"]:
@@ -425,7 +584,7 @@ def main(argv: list[str] | None = None) -> int:
     print("-" * 52)
     try:
         if args.gui:
-            from gui import settings_from_gui
+            from rdpauto.gui import settings_from_gui
             settings = settings_from_gui()
             if settings is None:
                 print("Cancelled.")
@@ -482,5 +641,5 @@ def main(argv: list[str] | None = None) -> int:
 if __name__ == "__main__":
     raise SystemExit(
         "rdpauto/session.py is part of the application, not an entry point. "
-        "Start it with:  python gui.py   (desktop)  or  python cli.py   (server)"
+        "Start it with:  python -m rdpauto.gui   (desktop)  or  python -m rdpauto.cli   (server)"
     )

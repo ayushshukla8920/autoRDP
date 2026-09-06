@@ -1,6 +1,6 @@
 """Phase 1: connect to a Windows server over RDP and drive it from a prompt.
 
-    python main.py
+    python -m rdpauto.cli
 
 The asyncio event loop runs on a worker thread and the command prompt stays on
 the main thread. That split matters on Windows: ``input()`` on the main thread
@@ -11,17 +11,15 @@ without tearing down the RDP session.
 from __future__ import annotations
 
 import argparse
-import asyncio
-import concurrent.futures
 import shlex
 import sys
-import threading
 import time
 from pathlib import Path
 
 from . import credentials
 from .config import ConfigError, Settings, setup_logging
 from .input_events import EmergencyStopped, InputError, SessionNotAcceptingInput
+from .loop import LoopThread
 from .rdp_client import ConnectionFailed, RdpClient
 
 HELP = """
@@ -41,56 +39,6 @@ Commands
   help                     this text
   quit                     disconnect and exit
 """.strip()
-
-
-class LoopThread:
-    """An asyncio event loop living on its own thread."""
-
-    def __init__(self) -> None:
-        self.loop = asyncio.new_event_loop()
-        self._thread = threading.Thread(target=self._run, name="rdp-loop", daemon=True)
-
-    def _run(self) -> None:
-        asyncio.set_event_loop(self.loop)
-        self.loop.run_forever()
-
-    def start(self) -> None:
-        self._thread.start()
-
-    def submit(self, coro) -> concurrent.futures.Future:
-        return asyncio.run_coroutine_threadsafe(coro, self.loop)
-
-    def run(self, coro, on_interrupt=None):
-        """Run a coroutine to completion, staying responsive to Ctrl+C.
-
-        Polling the future in short slices is what lets a Ctrl+C be delivered to
-        this thread; ``on_interrupt`` then asks the coroutine to wind itself down
-        rather than being abandoned mid-keystroke.
-        """
-        future = self.submit(coro)
-        interrupted = False
-        while True:
-            try:
-                return future.result(timeout=0.2)
-            except concurrent.futures.TimeoutError:
-                continue
-            except KeyboardInterrupt:
-                if interrupted:
-                    raise
-                interrupted = True
-                print("\n^C - stopping the current command...")
-                if on_interrupt is not None:
-                    on_interrupt()
-                try:
-                    future.result(timeout=5)
-                except Exception:  # noqa: BLE001 - already unwinding
-                    pass
-                raise
-
-    def close(self) -> None:
-        self.loop.call_soon_threadsafe(self.loop.stop)
-        self._thread.join(timeout=5)
-        self.loop.close()
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -117,7 +65,7 @@ def main(argv: list[str] | None = None) -> int:
     print("-" * 52)
     try:
         if args.gui:
-            from gui import settings_from_gui
+            from rdpauto.gui import settings_from_gui
             settings = settings_from_gui()
             if settings is None:
                 print("Cancelled.")
@@ -312,12 +260,12 @@ def dispatch(loop: LoopThread, client: RdpClient, settings: Settings,
               f" (file: {settings.stop_file})")
 
     elif command == "stop":
-        client.stop.trip("requested from the prompt")
-        print("Emergency stop tripped. Input is blocked until you run 'resume'.")
+        client.stop.pause("requested from the prompt")
+        print("Paused. Typing is suspended (session kept). Run 'resume' to continue.")
 
     elif command == "resume":
-        client.stop.reset()
-        print("Emergency stop cleared.")
+        client.stop.resume()
+        print("Resumed.")
 
     else:
         return False
@@ -340,5 +288,5 @@ def _coords(raw_x: str, raw_y: str, settings: Settings) -> tuple[int, int]:
 if __name__ == "__main__":
     raise SystemExit(
         "rdpauto/console.py is part of the application, not an entry point. "
-        "Start it with:  python gui.py   (desktop)  or  python cli.py   (server)"
+        "Start it with:  python -m rdpauto.gui   (desktop)  or  python -m rdpauto.cli   (server)"
     )

@@ -143,16 +143,29 @@ py -3.13 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 
 python -m pip install --upgrade pip
-pip install -r requirements.txt
+
+# Editable install: puts the `rdpauto` package (under src/) on the path and
+# creates the `autordp` / `autordp-gui` commands. Edit any file and just re-run
+# -- no rebuild, no reinstall. This is the normal development workflow.
+pip install -e .
 ```
 
-There is no config file to set up. The first run asks for the connection details
-and remembers them (see [section 12](#13-configuration)).
+`pip install -e .` reads `pyproject.toml`, so it pulls in `aardwolf` and Pillow
+too; you do not also need `pip install -r requirements.txt`. **You never rebuild
+the `.exe` to test a change** — that (section 15) is only for shipping a binary
+to a machine without Python.
+
+Optional secrets live in a `.env` file at the repo root (copy `.env.example`).
+It is gitignored and is where the Telegram token goes — see
+[section 12](#13-configuration).
+
+There is no other config to set up. The first run asks for the connection
+details and remembers them.
 
 Verify the install without touching the network:
 
 ```powershell
-python -c "import gui, cli; print('ok')"
+python -c "import rdpauto.gui, rdpauto.cli; print('ok')"
 ```
 
 ## 7. Enabling RDP on the Windows server
@@ -195,23 +208,27 @@ There are **two entry points**, one per environment. Every other file is a
 module and refuses to run on its own:
 
 ```powershell
-python gui.py     # desktop: a window
-python cli.py     # server:  a terminal, no tkinter
+python -m rdpauto.gui     # desktop: a window   (or: autordp-gui)
+python -m rdpauto.cli     # server:  a terminal, no tkinter   (or: autordp)
 ```
+
+The `autordp` / `autordp-gui` console scripts appear after `pip install -e .`
+(see [section 6](#6-installing)); the `python -m` forms work with just the
+`src` package on the path.
 
 Both offer the same five actions, share the same remembered profile, and run
 the same code underneath — `run_session` for the demos, `run_codebase_session`
 for repositories — so behaviour never drifts between them.
 
-### `cli.py`, for a VPS
+### `rdpauto.cli`, for a VPS
 
 ```bash
-python cli.py                                    # menu, prompts for what is missing
-python cli.py demo --editor code
-python cli.py repo https://github.com/pallets/click --minutes 30
-python cli.py repo https://github.com/me/proj --minutes 0    # no limit
-python cli.py test                               # interactive rdp> prompt
-python cli.py --forget
+python -m rdpauto.cli                                    # menu, prompts for what is missing
+python -m rdpauto.cli demo --editor code
+python -m rdpauto.cli repo https://github.com/pallets/click --minutes 30
+python -m rdpauto.cli repo https://github.com/me/proj --minutes 0    # no limit
+python -m rdpauto.cli test                               # interactive rdp> prompt
+python -m rdpauto.cli --forget
 ```
 
 With no arguments it prompts, offering everything it already knows as a default
@@ -277,7 +294,7 @@ a queue; a worker thread drives the session so a long `type` never freezes the
 UI; and the asyncio loop the RDP client lives on runs on a third. That is what
 lets the STOP button stay clickable while thousands of keystrokes are going out.
 
-`python gui.py --stop` opens just the floating STOP button, useful beside your
+`python -m rdpauto.gui --stop` opens just the floating STOP button, useful beside your
 own work during a long run.
 
 ### The interactive action
@@ -592,11 +609,16 @@ the server ends the session, or an administrator uses *Log off* / *Disconnect*:
 * `aardwolf` sets `disconnected_evt`, and every subsequent input call raises
   `SessionNotAcceptingInput` with a plain-language message. Nothing is sent into
   the void.
-* the interactive prompt notices and exits; a demo or codebase run aborts,
-  reports which step failed, and still disconnects cleanly.
-* Retries apply to *establishing* the connection (`RDP_CONNECT_RETRIES`), not to
-  reconnecting mid-run. Reconnecting mid-sequence would resume against unknown
-  remote UI state, so the tool stops instead of guessing.
+* the interactive prompt notices and exits.
+* a demo or codebase run now **reconnects** up to `RDP_RECONNECT_ATTEMPTS` times
+  (default 3, `RDP_RECONNECT_DELAY` apart). On success it retypes the current
+  file *from scratch* — safe because each file is self-contained (launch → clear
+  buffer → type → save), so nothing half-typed is left behind. If every attempt
+  fails it disconnects cleanly and, when `RDP_TELEGRAM_TOKEN` /
+  `RDP_TELEGRAM_CHAT_ID` are set, sends a Telegram alert so you find out without
+  watching the log.
+* Set `RDP_RECONNECT_ATTEMPTS=0` to restore the old behaviour (abort on the
+  first drop, no reconnect).
 
 What happens to the session itself is Windows' decision. A disconnected session
 keeps running by default: VS Code stays open and your file stays where it was.
@@ -671,8 +693,13 @@ Override the profile location with `RDP_PROFILE=<path>`.
 | `RDP_AUTH` | `ntlm` | `ntlm` (CredSSP/NLA), `kerberos`, or `plain` |
 | `RDP_WIDTH`, `RDP_HEIGHT` | `1280`, `800` | Also the `click` coordinate space |
 | `RDP_CONNECT_TIMEOUT` | `20` | Seconds per attempt |
-| `RDP_CONNECT_RETRIES` | `3` | Attempts before giving up |
+| `RDP_CONNECT_RETRIES` | `3` | Attempts before giving up (initial connect) |
 | `RDP_RETRY_DELAY` | `3` | Seconds between attempts |
+| `RDP_RECONNECT_ATTEMPTS` | `3` | Mid-run reconnects after a dropped session |
+| `RDP_RECONNECT_DELAY` | `5` | Seconds between reconnect attempts |
+| `RDP_STALL_TIMEOUT` | `45` | Frozen-screen seconds before typing is treated as stalled (0 = off) |
+| `RDP_TELEGRAM_TOKEN` | — | Bot token; alert fires when reconnect gives up |
+| `RDP_TELEGRAM_CHAT_ID` | — | Chat to send the alert to |
 | `RDP_CHAR_DELAY` | `0.012` | Between characters |
 | `RDP_KEY_DELAY` | `0.03` | Between key down and up |
 | `RDP_ACTION_DELAY` | `0.25` | After a click, chord, or Enter |
@@ -689,8 +716,8 @@ password are safe. `repr(Settings)` omits the password and logged URLs mask it.
 ## 14. The tkinter front end
 
 ```powershell
-python gui.py            # connection form + pick what to run
-python gui.py --stop     # just the floating STOP button
+python -m rdpauto.gui            # connection form + pick what to run
+python -m rdpauto.gui --stop     # just the floating STOP button
 ```
 
 The form collects host, port, username, domain, password and screen size,
@@ -710,7 +737,7 @@ to the real console, and only the session's threads are captured — `sys.stdout
 is process-global, and capturing it unconditionally swallowed output that had
 nothing to do with the run.
 
-`python gui.py --stop` opens a small always-on-top window with one big button
+`python -m rdpauto.gui --stop` opens a small always-on-top window with one big button
 that creates and removes the emergency stop file. It talks to nothing — it only
 touches that file — so it works even if the automation process is wedged, and
 you can leave it up beside your work while a long run is going.
@@ -816,17 +843,52 @@ Every file was filtered out: binaries, files over 20 KB, non-UTF-8, or emoji
 (which RDP's unicode key event cannot carry). The log lists the reason per file.
 
 **Everything hangs**
-`python gui.py --stop`, `New-Item STOP` in the project directory, or close the
+`python -m rdpauto.gui --stop`, `New-Item STOP` in the project directory, or close the
 runner window — closing it trips the stop and disconnects cleanly.
 
 Run with `RDP_LOG_LEVEL=DEBUG` for protocol-level detail, and
 `RDP_LOG_FILE=run.log` to keep it.
 
-## 16. Building autoRDP.exe
+## 16. Downloads & building
+
+### Prebuilt binaries (GitHub Actions releases)
+
+Pushing a `v*` tag (or running the **Release** workflow from the Actions tab)
+builds on GitHub's own Windows and Linux runners and publishes a release with
+these files attached:
+
+| File | Platform | What |
+|---|---|---|
+| `autordp-windows.exe` | Windows | one binary: CLI, or `--gui` for the desktop app |
+| `autordp-linux` | Linux | the same combined binary (ELF) |
+| `autoRDP-windows-gui.exe` | Windows | windowed GUI (no console) for double-click users |
+
+`autordp` runs the CLI by default and the desktop app with `autordp --gui`.
+
+```bash
+git tag v0.2.0 && git push origin v0.2.0     # -> a Release with all binaries
+```
+
+One-line install from the latest release (no clone):
+
+```bash
+# Linux
+curl -fsSL https://raw.githubusercontent.com/bewithsnehasish/autoRDP/main/install.sh | bash
+# Windows (PowerShell)
+irm https://raw.githubusercontent.com/bewithsnehasish/autoRDP/main/install.ps1 | iex
+```
+
+The Linux binary can only be produced on Linux (PyInstaller does not
+cross-compile), which is exactly what the Linux runner provides — no local
+Docker, WSL, or Linux machine needed. Two specs drive the builds:
+`autoRDP-app.spec` (the combined `autordp`) and `autoRDP.spec` (the windowed
+GUI), via `.github/workflows/release.yml`.
+
+### Building the Windows GUI locally
 
 ```powershell
 .\build.ps1                  # single autoRDP.exe in dist\
-.\build.ps1 -OneDir          # a folder that starts far faster
+.\build.ps1 -OneDir          # a folder that starts far faster and uses less RAM
 .\build.ps1 -Clean           # after changing the spec or a dependency
 ```
 
@@ -834,11 +896,11 @@ The script creates the virtual environment if missing, installs dependencies,
 regenerates the icon when `assets/icon-source.png` has changed, builds, and then
 **launches the exe to confirm it opens a window**.
 
-`autoRDP.exe` is the **GUI only**. The spec's entry point is `gui.py`, so
-`cli.py` is unreachable and PyInstaller does not bundle it — the packaged
-first-party modules are `gui` plus the `rdpauto` package, nothing else. On a
-server you run `cli.py` from a checkout rather than from the exe, which is the
-right shape anyway: a headless box has no display for the window the exe opens.
+`autoRDP.exe` is the **windowed GUI** (entry `pyinstaller_entry.py` ->
+`rdpauto.gui`, no console). The **combined** `autordp` binary — CLI plus
+`--gui` — is built from `autoRDP-app.spec` (entry `pyinstaller_app_entry.py`):
+`python -m PyInstaller autoRDP-app.spec --noconfirm` (-> `dist\autordp.exe`), or
+get it from a CI release above.
 
 That last step earns its keep. A PyInstaller build can succeed and still produce
 an exe that dies on startup, because this dependency tree imports things
@@ -914,35 +976,46 @@ itself, which will not work under `C:\Program Files`.
 ## 17. Project layout
 
 ```
-rdp-background-automation/
-├── gui.py               ENTRY POINT - desktop: form, runner window, live view
-├── cli.py               ENTRY POINT - server: menu and flags, never loads tkinter
-├── build.ps1            ENTRY POINT - one-click release build
+autoRDP/
+├── pyproject.toml       package metadata + the autordp / autordp-gui commands
+├── pyinstaller_entry.py thin script the .exe build starts from (calls gui.main)
+├── build.ps1            one-click release build
+├── autoRDP.spec         PyInstaller recipe (ONEFILE switch at the top)
+├── make_icon.py         keys the white background out of the artwork
+├── .env.example         copy to .env for the Telegram token (gitignored)
 │
-├── rdpauto/             the application; nothing here runs on its own
-│   ├── config.py        settings resolution, secure password prompt, logging
+├── src/rdpauto/         the application package (installed with `pip install -e .`)
+│   ├── cli.py           ENTRY POINT - server: menu and flags, never loads tkinter
+│   ├── config.py        settings resolution, .env loader, password prompt, logging
 │   ├── credentials.py   remembers the connection, DPAPI-encrypts the password
+│   ├── notify.py        Telegram alert, fired when reconnect gives up
+│   ├── loop.py          the asyncio-loop-on-a-thread (LoopThread)
 │   ├── input_events.py  keyboard/mouse RDP input events, emergency stop
 │   ├── rdp_client.py    connect, retry, screenshot, live frames, disconnect
-│   ├── console.py       command dispatch and the asyncio loop thread
-│   ├── session.py       editor profiles and the flows both front ends run
+│   ├── console.py       the rdp> command dispatch and REPL
+│   ├── session.py       editor profiles, the flows, reconnect wrapper
 │   ├── codebase.py      git clone, file selection, time budgeting
-│   └── code_generator.py   the harmless Python module the demo types
+│   ├── code_generator.py   the harmless Python module the demo types
+│   └── gui/             ENTRY POINT - desktop (python -m rdpauto.gui)
+│       ├── __init__.py  main(), form glue, run_in_window
+│       ├── form.py      the connection form (grouped sections, logo)
+│       ├── runner.py    the log/runner window with the status dot
+│       ├── liveview.py  the read-only remote-desktop mirror
+│       ├── stop.py      the floating emergency-STOP window
+│       └── icon.py      loads assets/autoRDP-256.png onto every window
 │
 ├── assets/
 │   ├── icon-source.png  the original artwork
 │   ├── autoRDP.ico      generated by make_icon.py, embedded in the exe
-│   └── autoRDP-256.png  generated too, handy for docs and shortcuts
+│   └── autoRDP-256.png  the window/taskbar logo the GUI loads at runtime
 │
-├── autoRDP.spec         PyInstaller recipe (ONEFILE switch at the top)
-├── make_icon.py         keys the white background out of the artwork
-├── requirements.txt
+├── requirements.txt     (kept for reference; pyproject is canonical)
 ├── .gitignore
 └── README.md
 ```
 
-Three entry points, one package. Everything under `rdpauto/` refuses to run
-directly and says which entry point to use instead. The two front ends are
+Two entry points (`rdpauto.gui`, `rdpauto.cli`), one package. Everything else
+under `rdpauto/` refuses to run directly and says which entry point to use. The two front ends are
 thin — they collect settings and call the same shared coroutines
 (`session.run_session`, `session.run_codebase_session`, `console.dispatch`) — so
 there is no second implementation to keep in step.

@@ -1,0 +1,96 @@
+name: Release
+
+# Builds the binaries and publishes a GitHub Release with them attached:
+#   - autordp-windows.exe       ONE binary: CLI, or `--gui` for the desktop app
+#   - autordp-linux             the same combined binary for Linux (ELF)
+#   - autoRDP-windows-gui.exe   windowed GUI (no console) for double-click users
+#
+# `autordp` runs the CLI by default and the GUI with `autordp --gui`.
+# Trigger by pushing a tag (git tag v0.2.0 && git push --tags) or from the
+# Actions tab -> Release -> Run workflow (give it a tag name).
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag, e.g. v0.2.0"
+        required: true
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write        # needed to create the release
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install . pyinstaller
+      - name: Build combined binary (CLI + GUI)
+        run: python -m PyInstaller autoRDP-app.spec --noconfirm
+      - name: Build windowed GUI exe (double-click, no console)
+        run: python -m PyInstaller autoRDP.spec --noconfirm
+      - name: Collect
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force out | Out-Null
+          Copy-Item dist/autordp.exe out/autordp-windows.exe
+          Copy-Item dist/autoRDP.exe out/autoRDP-windows-gui.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: out/*
+
+  linux:
+    # Pinned to 22.04 (glibc 2.35) on purpose: a binary built on a newer glibc
+    # will not run on older servers, but one built here runs on 22.04+ and most
+    # current distros. Bump only if you drop support for older targets.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: System tk (so the GUI path can be bundled)
+        run: sudo apt-get update && sudo apt-get install -y python3-tk
+      - name: Verify build deps resolve (fail early, not mid-build)
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install . pyinstaller
+          python -c "import tkinter, PIL.ImageTk; print('tkinter + PIL/tk OK')"
+          python -c "import aardwolf.connection, Cryptodome, cryptography; print('rdp stack OK')"
+      - name: Build combined binary (CLI + GUI)
+        run: pyinstaller autoRDP-app.spec --noconfirm
+      - name: Smoke test (CLI path)
+        run: ./dist/autordp --help
+      - name: Collect
+        run: |
+          mkdir -p out
+          cp dist/autordp out/autordp-linux
+          chmod +x out/autordp-linux
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: out/*
+
+  release:
+    needs: [windows, linux]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          name: ${{ github.event.inputs.tag || github.ref_name }}
+          files: artifacts/**/*
+          generate_release_notes: true

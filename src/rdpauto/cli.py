@@ -6,8 +6,8 @@ imports tkinter.
 
 Two ways to use it:
 
-    python cli.py                     # a menu, prompting for anything missing
-    python cli.py demo --editor code  # straight to it, for scripts and cron
+    python -m rdpauto.cli                     # a menu, prompting for anything missing
+    python -m rdpauto.cli demo --editor code  # straight to it, for scripts and cron
 
 Anything already known -- from the environment, or from the remembered profile
 -- is offered as a default you accept with Enter, so the interactive path is
@@ -20,13 +20,59 @@ import argparse
 import getpass
 import os
 import sys
+import threading
 
 from rdpauto import codebase, console, credentials, session
 from rdpauto.config import ConfigError, Settings, setup_logging
-from rdpauto.console import LoopThread
+from rdpauto.loop import LoopThread
 from rdpauto.input_events import (EmergencyStopped, InputError,
                                   SessionNotAcceptingInput)
+from rdpauto import logfmt
 from rdpauto.rdp_client import ConnectionFailed, RdpClient
+
+
+def _enable_ansi() -> bool:
+    """Best-effort: turn on ANSI colour in the Windows console. Returns whether
+    stdout is a terminal we should colour at all."""
+    if not sys.stdout.isatty():
+        return False
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            k = ctypes.windll.kernel32
+            k.SetConsoleMode(k.GetStdHandle(-11), 7)   # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+        except Exception:  # noqa: BLE001 - colour is a nicety, never fatal
+            return False
+    return True
+
+
+class _ColorStream:
+    """Line-buffers stdout and colours each finished line via :mod:`logfmt`, so
+    the CLI session log gets the same visual hierarchy as the GUI."""
+
+    def __init__(self, real) -> None:
+        self._real = real
+        self._buf = ""
+        self._lock = threading.Lock()   # loop thread and progress ticker both write
+
+    def write(self, text: str) -> int:
+        with self._lock:
+            self._buf += text
+            while "\n" in self._buf:
+                line, self._buf = self._buf.split("\n", 1)
+                self._real.write(logfmt.colorize(line) + "\n")
+        return len(text)
+
+    def flush(self) -> None:
+        with self._lock:
+            if self._buf:
+                self._real.write(self._buf)
+                self._buf = ""
+            self._real.flush()
+
+    def isatty(self) -> bool:
+        return True
+
 
 ACTIONS = {
     "1": ("test", "Connection test        - an interactive rdp> prompt"),
@@ -36,7 +82,7 @@ ACTIONS = {
     "5": ("repo-code", "Type a codebase        - clone a git repo, into VS Code"),
 }
 
-# What `python cli.py <action>` accepts, and which editor it implies.
+# What `python -m rdpauto.cli <action>` accepts, and which editor it implies.
 SHORTHAND = {"test": "test", "demo": "demo-", "repo": "repo-"}
 
 
@@ -88,7 +134,8 @@ def choose_action() -> str | None:
 
 def collect_settings(args: argparse.Namespace, interactive: bool) -> Settings:
     """Resolve connection details, prompting only for what is still missing."""
-    saved = credentials.load()
+    # If a specific --host was given, load that saved server; else the last-used.
+    saved = credentials.load((args.host or "").strip() or None)
 
     def pick(flag, env, key):
         return (flag or os.environ.get(env, "").strip() or saved.get(key, ""))
@@ -114,13 +161,52 @@ def collect_settings(args: argparse.Namespace, interactive: bool) -> Settings:
         raise ConfigError(
             "Missing " + ", ".join(missing) +
             ". Pass them as flags, set RDP_HOST/RDP_USERNAME/RDP_PASSWORD, "
-            "or run `python cli.py` with no arguments to be prompted.")
+            "or run `python -m rdpauto.cli` with no arguments to be prompted.")
 
     for key, value in (("RDP_HOST", host), ("RDP_USERNAME", username),
                        ("RDP_DOMAIN", domain), ("RDP_PORT", port),
                        ("RDP_PASSWORD", password)):
         os.environ[key] = value
-    return Settings.load(interactive=False)
+    settings = Settings.load(interactive=False)
+    # Don't leave the plaintext password in the environment: it would otherwise
+    # be inherited by child processes such as the git clone in codebase.clone.
+    os.environ.pop("RDP_PASSWORD", None)
+    return settings
+
+
+def _print_summary(settings: Settings, action: str) -> None:
+    """Show the resolved connection details (so auto-filled values are visible)
+    before doing anything with them."""
+    pw = "******** (saved/entered)" if settings.password else "(none!)"
+    tg = "on" if (settings.telegram_token and settings.telegram_chat_id) else "off"
+    print("\nUsing these details:")
+    print(f"  server    : {settings.host}:{settings.port}")
+    print(f"  username  : {settings.username}" +
+          (f"   domain: {settings.domain}" if settings.domain else ""))
+    print(f"  password  : {pw}")
+    print(f"  screen    : {settings.width}x{settings.height}")
+    print(f"  telegram  : {tg}")
+    print(f"  action    : {action}\n")
+
+
+def _progress_ticker(progress: "session.Progress", stop: threading.Event,
+                     every: float = 8.0) -> None:
+    """Print a one-line progress bar every few seconds during a codebase run,
+    so the terminal shows it is alive even mid-file. Stops when ``stop`` is set."""
+    while not stop.wait(every):
+        if not (progress.active and progress.total):
+            continue
+        pct = int(100 * progress.done / progress.total)
+        filled = pct // 5
+        bar = "#" * filled + "-" * (20 - filled)
+        if progress.phase == "done":
+            print(f"  [{bar}] 100%  {progress.total} files typed in "
+                  f"{codebase.human_time(progress.elapsed())}", flush=True)
+            return
+        print(f"  [{bar}] {pct:3d}%  files {progress.done}/{progress.total}  "
+              f"now: {progress.current}  "
+              f"elapsed {codebase.human_time(progress.elapsed())}  "
+              f"left ~{codebase.human_time(progress.eta_seconds())}", flush=True)
 
 
 def run(action: str, settings: Settings, args: argparse.Namespace) -> int:
@@ -138,7 +224,15 @@ def run(action: str, settings: Settings, args: argparse.Namespace) -> int:
     if args.seed is not None:
         run_args.seed = args.seed
 
-    print(f"\nEmergency stop: create {settings.stop_file}, or press Ctrl+C\n")
+    _print_summary(settings, action)
+    print(f"Emergency stop: create {settings.stop_file}, or press Ctrl+C\n")
+
+    # Colour the session log to match the GUI -- but not for the `test` REPL,
+    # whose input() prompts do not play well with a line-buffered stream.
+    real_stdout = sys.stdout
+    use_color = _enable_ansi() and action != "test"
+    if use_color:
+        sys.stdout = _ColorStream(real_stdout)
 
     loop = LoopThread()
     loop.start()
@@ -154,8 +248,17 @@ def run(action: str, settings: Settings, args: argparse.Namespace) -> int:
             return console.repl(loop, client, settings)
 
         if action.startswith("repo"):
-            loop.run(session.run_codebase_session(
-                client, run_args, args.repo, args.minutes * 60.0), on_interrupt=trip)
+            progress = session.Progress()
+            stop_ticker = threading.Event()
+            ticker = threading.Thread(target=_progress_ticker,
+                                      args=(progress, stop_ticker), daemon=True)
+            ticker.start()
+            try:
+                loop.run(session.run_codebase_session(
+                    client, run_args, args.repo, args.minutes * 60.0, progress),
+                    on_interrupt=trip)
+            finally:
+                stop_ticker.set()
         else:
             loop.run(session.run_session(client, run_args), on_interrupt=trip)
         print("\nFinished.")
@@ -185,18 +288,71 @@ def run(action: str, settings: Settings, args: argparse.Namespace) -> int:
         except Exception as exc:  # noqa: BLE001
             print(f"Warning: unclean disconnect: {exc}", file=sys.stderr)
         loop.close()
+        if use_color:
+            sys.stdout.flush()
+            sys.stdout = real_stdout
+
+
+_DESCRIPTION = """\
+autordp - headless RDP automation.
+
+Opens its OWN Remote Desktop connection to a Windows server and drives the
+remote desktop by sending RDP keyboard/mouse events. Your local machine is
+never touched. Runs fully in a terminal (no display needed), so it works on a
+headless server. Use the GUI (python -m rdpauto.gui) where a display exists.
+"""
+
+_EPILOG = """\
+ACTIONS (positional)
+  (none)            show an interactive menu, prompting for anything missing
+  test              connect, then drop into the interactive rdp> prompt below
+  demo              type a generated Python file into the remote editor
+  repo <url>        clone a git repo and type its files into the remote editor
+
+COMMON OPTIONS
+  --editor notepad|code     which remote editor to drive (default notepad)
+  --minutes N               time budget for 'repo'; 0 = no limit (default 10)
+  --run                     run the demo file after saving it
+  --seed N                  reproducible demo file
+  --no-screenshots          skip the progress screenshots
+  --host/--username/--domain/--port   override connection details
+  --remember                also remember the password (Windows only, DPAPI)
+  --forget                  delete the remembered connection details and exit
+
+INTERACTIVE rdp> COMMANDS (in the 'test' action)
+{repl}
+
+DESKTOP GUI (where a display exists)
+  autordp --gui             open the connection form + runner window
+  autordp --gui --stop      just the floating emergency-STOP button
+
+CONFIGURATION (environment, or a .env file next to the binary)
+  RDP_HOST RDP_USERNAME RDP_PASSWORD RDP_DOMAIN RDP_PORT   connection
+  RDP_AUTH=ntlm|kerberos|plain        RDP_WIDTH RDP_HEIGHT
+  RDP_RECONNECT_ATTEMPTS RDP_STALL_TIMEOUT    resilience
+  RDP_TELEGRAM_TOKEN RDP_TELEGRAM_CHAT_ID     alert if reconnect fails
+  (on Linux the password is not remembered - set RDP_PASSWORD or use .env)
+
+EMERGENCY STOP
+  Press Ctrl+C to abort, or create a file named STOP next to the binary.
+  In the rdp> prompt: 'stop' pauses (session kept), 'resume' continues.
+
+EXAMPLES
+  autordp                                       # menu, prompts for anything missing
+  autordp test                                  # interactive rdp> prompt
+  autordp demo --editor code --run
+  autordp repo https://github.com/pallets/click --minutes 30
+  autordp repo https://github.com/me/proj --minutes 0        # whole repo, no limit
+  autordp --forget
+""".format(repl="\n".join("  " + line for line in console.HELP.splitlines()
+                          if line.strip() and not line.startswith("Commands")))
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        prog="cli.py",
-        description="Console front end for rdp-background-automation "
-                    "(use gui.py where there is a display).",
-        epilog="Examples:\n"
-               "  python cli.py\n"
-               "  python cli.py demo --editor code\n"
-               "  python cli.py repo https://github.com/pallets/click --minutes 30\n"
-               "  python cli.py repo https://github.com/me/proj --minutes 0   (no limit)",
+        prog="autordp",
+        description=_DESCRIPTION,
+        epilog=_EPILOG,
         formatter_class=argparse.RawDescriptionHelpFormatter)
 
     parser.add_argument("action", nargs="?", choices=sorted(SHORTHAND),
@@ -262,7 +418,7 @@ def main(argv: list[str] | None = None) -> int:
         if not args.repo:
             if not interactive:
                 print("A repository URL is required: "
-                      "python cli.py repo <url>", file=sys.stderr)
+                      "python -m rdpauto.cli repo <url>", file=sys.stderr)
                 return 2
             args.repo = ask("Repository URL", required=True)
             args.minutes = float(ask("Minutes to spend (0 = no limit)", "10") or 10)
