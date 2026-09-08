@@ -1,0 +1,305 @@
+# Build a binary on every supported platform, then publish the npm packages.
+#
+# Two ways to release, and neither happens on a plain push to main:
+#
+#   on demand   Actions -> release -> Run workflow, with dry_run unticked.
+#               Publishes whatever __version__ says, then tags the commit so
+#               there is still a record of what produced that version.
+#   by tag      push a `v*` tag. verify refuses if it disagrees with the source.
+#
+# Either way the version comes from one place, `__version__` in
+# src/autordp/__init__.py, which scripts/build-npm.mjs stamps into every
+# package.json. Nothing else carries a version, so they cannot drift.
+#
+# Two ordering rules keep a failure from leaving the registry half-published:
+#
+#   1. verify refuses to start if the version is already on npm. npm never
+#      allows a version to be reused, even after `npm unpublish`, so without
+#      this a forgotten bump fails *mid-loop* -- some platform packages live,
+#      no launcher, and the version burned for the rest.
+#   2. Platform packages publish before the launcher. The launcher lists them
+#      as optionalDependencies, so an install landing between the two must not
+#      find a launcher whose dependencies do not exist yet.
+
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Build and pack, but do not publish"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+env:
+  # aardwolf 0.2.13 has prebuilt wheels up to CPython 3.13 and no further; 3.14
+  # would need a Rust toolchain on every runner. See requirements.txt.
+  PYTHON_VERSION: "3.13"
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: version
+        shell: bash
+        run: |
+          version=$(grep -oP '__version__\s*=\s*"\K[^"]+' src/autordp/__init__.py)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "source version: $version"
+
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            tag="${GITHUB_REF#refs/tags/v}"
+            if [[ "$tag" != "$version" ]]; then
+              echo "::error::tag v$tag does not match __version__ $version"
+              exit 1
+            fi
+          fi
+
+      # The guard that makes on-demand publishing safe. Without it, forgetting
+      # to bump __version__ fails inside the publish loop, after some platform
+      # packages are already live -- and npm will not let those versions be
+      # reused, so the only way out is a version bump anyway. Far better to
+      # find out here, before a single binary has been built.
+      - name: Refuse to reuse a published version
+        if: ${{ github.event_name == 'workflow_dispatch' && !inputs.dry_run }}
+        shell: bash
+        run: |
+          version="${{ steps.version.outputs.version }}"
+          scope="@ayushshukla8920"
+          taken=()
+          for suffix in "" "-win32-x64" "-linux-x64" "-linux-arm64" "-darwin-arm64"; do
+            pkg="$scope/autordp$suffix"
+            # `npm view` exits non-zero with E404 when the version is absent,
+            # which is the answer we want, so failure here is success.
+            if npm view "$pkg@$version" version >/dev/null 2>&1; then
+              taken+=("$pkg")
+            fi
+          done
+          if [[ ${#taken[@]} -gt 0 ]]; then
+            printf '::error::version %s is already published for: %s. Bump __version__ in src/autordp/__init__.py.\n' \
+              "$version" "${taken[*]}"
+            exit 1
+          fi
+          echo "$version is free on the registry"
+
+  # `optional: true` marks a platform aardwolf 0.2.13 publishes no wheel for.
+  # Those have to compile its Rust RLE extension from the sdist, which is
+  # slower and more fragile, so they are allowed to fail without taking the
+  # release with them: build-npm.mjs declares only the platforms that actually
+  # produced a binary, and the launcher tells anyone on a missing one to
+  # `pip install autordp` instead. Better three platforms published than five
+  # blocked on one toolchain.
+  #
+  #   wheel        win_amd64, manylinux_2_17_x86_64, macosx_11_0_arm64
+  #   no wheel     linux aarch64, macOS x86_64
+  build:
+    needs: verify
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: windows-latest, key: win32-x64, optional: false }
+          # 22.04 rather than latest for the two Linux builds: glibc is forward
+          # compatible but not backward, so a binary linked against the newest
+          # runner's glibc refuses to start on an older server -- which is
+          # exactly the kind of machine this tool tends to be run from.
+          - { os: ubuntu-22.04, key: linux-x64, optional: false }
+          - { os: macos-14, key: darwin-arm64, optional: false }
+          - { os: ubuntu-22.04-arm, key: linux-arm64, optional: true }
+          # darwin-x64 is deliberately absent. GitHub retired the macos-13
+          # runners, and a retired label does not error -- the job is accepted
+          # and then queues forever waiting for a runner that will never come,
+          # which `continue-on-error` cannot rescue because the job never
+          # starts. That stalls `publish` indefinitely and blocks the whole
+          # release for the sake of one platform.
+          #
+          # `macos-15-intel` is the replacement label. It is untried here, and
+          # aardwolf has no macOS x86_64 wheel either, so it would be a Rust
+          # source build like linux-arm64. Worth adding once it can be verified
+          # without holding a release hostage; until then Intel Macs get
+          # `pip install autordp`.
+
+    runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.optional }}
+    # A stuck or pathologically slow runner should cost minutes, not the six
+    # hours GitHub allows by default. A Rust build of aardwolf takes ~5.
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      # Only the wheel-less platforms need this. aardwolf's sdist declares
+      # setuptools-rust in build-system.requires, so pip installs that itself
+      # in the isolated build environment -- but it still needs a cargo to
+      # call. The runner images ship one; this is the belt to that braces.
+      - name: Ensure a Rust toolchain
+        if: matrix.optional
+        shell: bash
+        run: |
+          if command -v cargo >/dev/null 2>&1; then
+            echo "cargo already present: $(cargo --version)"
+          else
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          fi
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          # Quoted: unquoted, both bash and pwsh read `>=` as a redirection.
+          pip install -r requirements.txt "pyinstaller>=6.3"
+
+      - name: Build
+        run: python -m PyInstaller autordp.spec --noconfirm --clean
+
+      # "It compiled" is not evidence. PyInstaller happily produces a binary
+      # that is missing half of what it needs, because aardwolf imports its
+      # keyboard layouts and unicrypto its crypto backend dynamically and
+      # static analysis sees neither. These commands exercise argument parsing,
+      # the packaged RDP stack and JSON output, without needing a server.
+      - name: Smoke test
+        shell: bash
+        run: |
+          # An `if`, not `[[ ... ]] && ...`: GitHub runs bash with -e, so the
+          # one-liner's false test would exit 1 and fail the step everywhere
+          # except Windows.
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            binary=dist/autordp.exe
+          else
+            binary=dist/autordp
+          fi
+
+          "$binary" --version
+          "$binary" keys ctrl
+          "$binary" repo --help > /dev/null
+
+          # `|| true`: doctor exits 1 when anything about *this machine* is
+          # wrong, and a bare runner legitimately has no saved profile and no
+          # server to reach. Only the two build checks below decide the step,
+          # and the Python block names the one that failed -- which `set -e`
+          # aborting here would hide.
+          "$binary" doctor --json --no-network --no-input > doctor.json || true
+          cat doctor.json
+
+          # `keyboard layout` is the important assertion. A build missing the
+          # layout modules starts fine, connects fine, and dies on the first
+          # keystroke -- possibly twenty minutes into a run. Checking it here
+          # is what stops such a build being published.
+          python - <<'PY'
+          import json, sys
+          checks = {c["name"]: c for c in json.load(open("doctor.json"))["checks"]}
+          broken = [name for name in ("rdp stack", "keyboard layout")
+                    if checks.get(name, {}).get("status") != "ok"]
+          if broken:
+              for name in broken:
+                  print(f"FAILED {name}: {checks.get(name)}", file=sys.stderr)
+              sys.exit("the bundled RDP stack is incomplete; do not ship this build")
+          for name in ("rdp stack", "keyboard layout"):
+              print(f"{name}: {checks[name]['detail']}")
+          PY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: autordp-${{ matrix.key }}
+          path: dist/autordp*
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: [verify, build]
+    runs-on: ubuntu-latest
+    permissions:
+      # write, so an on-demand run can tag the commit it published from.
+      contents: write
+      # Required for npm provenance, which records in the registry which
+      # workflow run built each package.
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist/artifacts
+          pattern: autordp-*
+
+      - name: Assemble the npm packages
+        run: node scripts/build-npm.mjs --artifacts dist/artifacts --out dist/npm
+
+      - name: Pack and inspect
+        run: |
+          for dir in dist/npm/*/; do
+            echo "--- $dir"
+            (cd "$dir" && npm pack --dry-run)
+          done
+
+      - name: Publish
+        if: github.event_name == 'push' || inputs.dry_run == false
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Platform packages first: the launcher depends on them, and an
+          # install landing between the two publishes must not find a launcher
+          # whose optionalDependencies do not yet exist.
+          for dir in dist/npm/autordp-*/; do
+            echo "publishing $dir"
+            npm publish "$dir" --access public --provenance
+          done
+          npm publish dist/npm/autordp --access public --provenance
+
+      # A tag push already carries one. An on-demand run does not, and without
+      # this there would be no record of which commit produced a given version
+      # -- which is the one thing you want when a published binary misbehaves.
+      - name: Tag the published commit
+        if: ${{ github.event_name == 'workflow_dispatch' && !inputs.dry_run }}
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "v$VERSION" -m "autordp $VERSION (published by run $GITHUB_RUN_ID)"
+          git push origin "v$VERSION"
+
+      - name: Summary
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          published=$([[ "${{ github.event_name }}" == "push" || "${{ inputs.dry_run }}" == "false" ]] \
+            && echo yes || echo "no (dry run)")
+          {
+            echo "### autordp $VERSION"
+            echo
+            echo "Published: **$published**"
+            echo
+            echo '| package | size |'
+            echo '|---|---|'
+            for dir in dist/npm/*/; do
+              name=$(basename "$dir")
+              size=$(du -sh "$dir" | cut -f1)
+              echo "| \`@ayushshukla8920/$name\` | $size |"
+            done
+            echo
+            echo '```sh'
+            echo "npm install -g @ayushshukla8920/autordp@$VERSION"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
