@@ -1,0 +1,30 @@
+# Credentials. The remembered profile lives in %LOCALAPPDATA%, not here, but
+# ignore it anyway in case RDP_PROFILE is pointed at the project.
+profile.json
+.env
+
+# Emergency stop sentinel
+STOP
+
+# Captured screens and logs.
+# Deliberately NOT a blanket *.png: assets/ holds the icon source and the
+# icon generated from it, and both belong in the repo.
+screenshots/
+*.log
+
+# Build output. autordp.spec is source; everything it produces is not.
+build/
+dist/
+
+# npm. npm/autordp/ is source -- the launcher, its postinstall and its README.
+# The assembled packages land in dist/npm, covered by dist/ above.
+node_modules/
+*.tgz
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/

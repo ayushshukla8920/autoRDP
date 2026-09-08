@@ -1,0 +1,57 @@
+# Python packaging metadata.
+#
+# The primary distribution channel is npm -- `npm i -g @ayushshukla8920/autordp`
+# fetches a PyInstaller binary and needs no Python at all. This file exists for
+# the other two audiences: anyone who would rather `pip install` it, and CI,
+# which needs an installable package to build that binary from in the first
+# place.
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "autordp"
+dynamic = ["version"]
+description = "Drive a Windows machine over RDP, in a session the tool opens itself"
+readme = "README.md"
+requires-python = ">=3.9,<3.14"
+license = { text = "MIT" }
+authors = [{ name = "Ayush Shukla" }]
+keywords = ["rdp", "automation", "windows", "remote-desktop", "cli"]
+classifiers = [
+    "Environment :: Console",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Topic :: System :: Systems Administration",
+]
+
+# Pinned for the reason spelled out in requirements.txt: 0.2.13 is the newest
+# release with prebuilt wheels for CPython 3.9-3.13, and 0.2.14 is source-only
+# and needs a Rust toolchain. A CI matrix across three operating systems is
+# exactly where that would go wrong.
+#
+# Nothing else is needed. Pillow arrives with aardwolf and is what turns the
+# desktop buffer into a PNG or a JPEG; the terminal rendering and the live view
+# are both standard library.
+dependencies = ["aardwolf==0.2.13"]
+
+[project.urls]
+Homepage = "https://github.com/ayushshukla8920/autoRDP"
+Issues = "https://github.com/ayushshukla8920/autoRDP/issues"
+
+[project.scripts]
+autordp = "autordp.cli.main:main"
+
+[project.optional-dependencies]
+build = ["pyinstaller>=6.3"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.dynamic]
+version = { attr = "autordp.__version__" }

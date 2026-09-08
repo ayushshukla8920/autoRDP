@@ -1,0 +1,22 @@
+# Pinned to 0.2.13: it is the newest release with prebuilt wheels at all.
+# 0.2.14 is source-only. Even 0.2.13 only covers three of the five platforms
+# the npm packages target -- these, for CPython 3.9-3.13:
+#
+#     win_amd64                 -> win32-x64
+#     manylinux_2_17_x86_64     -> linux-x64
+#     macosx_11_0_arm64         -> darwin-arm64
+#
+# There is no aarch64 Linux wheel and no macOS x86_64 wheel, so linux-arm64 and
+# darwin-x64 have to compile aardwolf's Rust RLE decoder from the sdist. Its
+# pyproject declares setuptools-rust in build-system.requires, so pip handles
+# that itself given a cargo on PATH -- but it is slow and it is the part of the
+# release most likely to break, which is why release.yml marks those two
+# platforms optional.
+aardwolf==0.2.13
+
+# Nothing else. Pillow comes in via aardwolf and is what turns the desktop
+# buffer into a PNG for `screenshot` and a JPEG for the live view. The terminal
+# rendering is hand-rolled ANSI rather than rich, the live view is http.server
+# rather than a web framework, and the credential store reaches DPAPI through
+# ctypes -- every one of those is a dependency PyInstaller would otherwise have
+# to bundle into the binary npm ships on five platforms.

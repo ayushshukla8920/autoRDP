@@ -1,0 +1,46 @@
+{
+  "name": "@ayushshukla8920/autordp",
+  "version": "0.1.0",
+  "description": "Drive a Windows machine over RDP, in a session the tool opens itself. No Python required.",
+  "keywords": [
+    "rdp",
+    "remote-desktop",
+    "automation",
+    "windows",
+    "cli",
+    "mstsc"
+  ],
+  "homepage": "https://github.com/ayushshukla8920/autoRDP#readme",
+  "bugs": "https://github.com/ayushshukla8920/autoRDP/issues",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ayushshukla8920/autoRDP.git"
+  },
+  "license": "MIT",
+  "author": "Ayush Shukla",
+  "type": "commonjs",
+  "bin": {
+    "autordp": "bin/autordp.js"
+  },
+  "files": [
+    "bin/autordp.js",
+    "install.js",
+    "README.md"
+  ],
+  "scripts": {
+    "postinstall": "node install.js"
+  },
+  "engines": {
+    "node": ">=16"
+  },
+  "optionalDependencies": {
+    "@ayushshukla8920/autordp-darwin-arm64": "0.1.0",
+    "@ayushshukla8920/autordp-darwin-x64": "0.1.0",
+    "@ayushshukla8920/autordp-linux-arm64": "0.1.0",
+    "@ayushshukla8920/autordp-linux-x64": "0.1.0",
+    "@ayushshukla8920/autordp-win32-x64": "0.1.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

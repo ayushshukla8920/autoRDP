@@ -1,0 +1,243 @@
+# Fast checks on every push and pull request.
+#
+# Deliberately does not build the PyInstaller binaries -- that is five runners
+# and several minutes, and release.yml already does it. What this catches is
+# the cheap-to-catch class: a syntax error, an import that only resolves on the
+# author's machine, a subcommand that no longer parses, a broken live view, a
+# JavaScript typo in the npm launcher. Everything here runs without a Windows
+# server to talk to.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  python:
+    strategy:
+      fail-fast: false
+      matrix:
+        # The oldest and newest interpreters the package claims to support.
+        # Anything in between that breaks would break one of these too.
+        include:
+          - { os: ubuntu-latest, python: "3.9" }
+          - { os: ubuntu-latest, python: "3.13" }
+          - { os: windows-latest, python: "3.13" }
+          - { os: macos-latest, python: "3.13" }
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+
+      - name: Every module imports
+        shell: bash
+        run: |
+          python - <<'PY'
+          import importlib
+          for name in ("autordp", "autordp.cli", "autordp.cli.ui",
+                       "autordp.cli.parser", "autordp.cli.context",
+                       "autordp.cli.commands", "autordp.cli.menu",
+                       "autordp.cli.main", "autordp.client", "autordp.codebase",
+                       "autordp.config", "autordp.credentials", "autordp.input",
+                       "autordp.loop", "autordp.session", "autordp.shell",
+                       "autordp.webview"):
+              importlib.import_module(name)
+              print("ok", name)
+          PY
+
+      # Parsing is where a CLI regression shows up first and cheapest: a
+      # renamed dest, a flag moved to the wrong parent, a subcommand that no
+      # longer accepts what the README says it does.
+      - name: Every subcommand parses
+        shell: bash
+        run: |
+          python - <<'PY'
+          from autordp.cli import parser
+
+          for argv in [
+              ["--version"], ["--help"],
+              ["connect", "--help"], ["repo", "--help"], ["config", "--help"],
+              ["doctor", "--help"], ["keys", "--help"],
+              ["connect", "-c", "type hello", "--keep-open", "--view"],
+              ["repo", "https://example.com/x.git", "-m", "0", "--dry-run"],
+              ["repo", "u", "--editor", "code", "--view", "9000"],
+              ["config", "set", "--remember-password"],
+              ["config", "show", "--json"],
+              ["doctor", "--no-network", "--json"],
+              ["keys", "ctrl"],
+          ]:
+              try:
+                  parser.parse(argv)
+              except SystemExit as exc:
+                  assert exc.code in (0, None), (argv, exc.code)
+                  print("ok (exits)", argv)
+                  continue
+              print("ok", argv)
+
+          # The suppressed-default mechanism, asserted rather than assumed:
+          # connection flags must work before *and* after the subcommand.
+          assert parser.parse(["--host", "a", "repo", "u"]).host == "a"
+          assert parser.parse(["repo", "u", "--host", "a"]).host == "a"
+          assert parser.parse(["repo", "u"]).host == ""
+          print("shared connection flags survive both orders")
+
+          # Every subcommand must survive its own options. An option whose dest
+          # collides with the subparsers' `command` silently overwrites it, and
+          # the dispatcher then routes on a list instead of a name -- which is
+          # exactly what `connect -c` did before it was given its own dest.
+          for argv, expected in [
+              (["connect", "-c", "type hi"], "connect"),
+              (["repo", "u", "--dry-run"], "repo"),
+              (["config", "show"], "config"),
+              (["doctor"], "doctor"),
+              (["keys"], "keys"),
+          ]:
+              actual = parser.parse(argv).command
+              assert actual == expected, f"{argv} -> {actual!r}, want {expected!r}"
+          assert parser.parse(["connect", "-c", "a", "-c", "b"]).run_commands == ["a", "b"]
+
+          # --view is optional-argument: bare means the default port.
+          from autordp.webview import DEFAULT_PORT
+          assert parser.parse(["connect"]).view is None
+          assert parser.parse(["connect", "--view"]).view == DEFAULT_PORT
+          assert parser.parse(["connect", "--view", "9000"]).view == 9000
+          print("every subcommand routes on its own name")
+          PY
+
+      # The live view is plain HTTP over a PIL image, so it can be exercised
+      # end to end against a stand-in client with no RDP server anywhere.
+      - name: Live view serves frames
+        shell: bash
+        run: |
+          python - <<'PY'
+          import io, json, time, urllib.request
+          from PIL import Image
+          from autordp.webview import LiveView, free_port
+
+          class Stop: tripped = False
+          class Config: target, width, height = "t@h:3389", 64, 48
+          class Client:
+              is_alive, stop, settings = True, Stop(), Config()
+              n = 0
+              def current_frame(self):
+                  # A *different* image each call, like a real desktop. A
+                  # constant one would exercise the opposite path: the stream
+                  # deliberately withholds an unchanged frame for up to
+                  # IDLE_KEEPALIVE seconds, which is what keeps an idle session
+                  # near zero bandwidth -- and would stall this test instead.
+                  self.n += 1
+                  return Image.new("RGB", (64, 48), (self.n % 256, 20, 30))
+
+          view = LiveView(Client(), port=free_port(8907), max_fps=30)
+          url = view.start()
+          try:
+              time.sleep(0.3)
+              page = urllib.request.urlopen(url, timeout=5).read()
+              assert b"/stream" in page and b"cannot send input" in page
+
+              info = json.loads(urllib.request.urlopen(url + "status.json", timeout=5).read())
+              assert info["connected"] and info["width"] == 64, info
+
+              frame = urllib.request.urlopen(url + "frame.jpg", timeout=5)
+              assert frame.headers["Content-Type"] == "image/jpeg"
+              assert Image.open(io.BytesIO(frame.read())).size == (64, 48)
+
+              stream = urllib.request.urlopen(url + "stream", timeout=10)
+              assert "multipart/x-mixed-replace" in stream.headers["Content-Type"]
+              chunk, deadline = b"", time.time() + 15
+              while chunk.count(b"--autordpframe") < 2 and time.time() < deadline:
+                  # read1, not read: read(n) blocks until it has all n bytes or
+                  # hits EOF, and an MJPEG response never ends. read1 returns
+                  # whatever has arrived.
+                  data = stream.read1(4096)
+                  if not data:
+                      break
+                  chunk += data
+              stream.close()
+              assert chunk.count(b"--autordpframe") >= 2, chunk[:200]
+              print("live view: page, status, frame and stream all served")
+          finally:
+              view.stop()
+          PY
+
+      - name: Commands that need no server
+        shell: bash
+        run: |
+          autordp --version
+          autordp keys ctrl
+          autordp config path
+          autordp config env --json > /dev/null
+          # doctor exits 1 when something is broken, and on a runner with no
+          # saved profile the port probe has nothing to aim at -- so only the
+          # JSON shape is asserted here, not the exit code.
+          autordp doctor --json --no-network --no-input > doctor.json || true
+          python -c "import json; d=json.load(open('doctor.json')); assert 'checks' in d; print(len(d['checks']), 'checks')"
+
+  node:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Syntax
+        run: |
+          node --check npm/autordp/bin/autordp.js
+          node --check npm/autordp/install.js
+          node --check scripts/build-npm.mjs
+
+      # A stub binary is enough to prove the whole assembly path: the launcher
+      # finds it, the manifests are well formed, and the modes survive.
+      - name: Assemble against a stub binary
+        run: |
+          set -euo pipefail
+          for key in win32-x64 linux-x64 linux-arm64 darwin-arm64; do
+            mkdir -p "dist/artifacts/autordp-$key"
+            name=autordp
+            if [[ "$key" == win32-* ]]; then name=autordp.exe; fi
+            printf '#!/bin/sh\necho stub\n' > "dist/artifacts/autordp-$key/$name"
+          done
+          node scripts/build-npm.mjs --artifacts dist/artifacts --out dist/npm
+
+          version=$(grep -oP '__version__\s*=\s*"\K[^"]+' src/autordp/__init__.py)
+          node -e "
+            const fs = require('fs');
+            const launcher = JSON.parse(fs.readFileSync('dist/npm/autordp/package.json'));
+            const expected = '$version';
+            if (launcher.version !== expected) throw new Error('launcher version ' + launcher.version);
+            if (!launcher.bin.autordp) throw new Error('launcher declares no autordp bin');
+            const optional = Object.entries(launcher.optionalDependencies);
+            if (optional.length !== 4) throw new Error('expected 4 platform deps, got ' + optional.length);
+            for (const [name, v] of optional) {
+              if (v !== expected) throw new Error(name + ' pinned to ' + v);
+              const dir = 'dist/npm/' + name.split('/')[1];
+              const manifest = JSON.parse(fs.readFileSync(dir + '/package.json'));
+              if (!manifest.os || !manifest.cpu) throw new Error(name + ' has no os/cpu');
+            }
+            console.log('launcher and', optional.length, 'platform packages at', expected);
+          "
+
+      - name: Launcher reports a missing binary clearly
+        run: |
+          set -euo pipefail
+          # Run it with nothing installed: it must fail with guidance, not a
+          # module-not-found stack trace.
+          output=$(node dist/npm/autordp/bin/autordp.js --version 2>&1 || true)
+          echo "$output"
+          echo "$output" | grep -q "not installed"
