@@ -1,0 +1,73 @@
+# systemd unit for a persistent autordp session on a Linux box (EC2, a VPS).
+#
+# `autordp connect -d` already survives the SSH session ending, which is what
+# most people actually want. This is for the other thing it deliberately does
+# not do: come back after a reboot, and restart if it dies.
+#
+#   sudo cp deploy/autordp.service /etc/systemd/system/
+#   sudo systemctl edit autordp            # put RDP_PASSWORD in the override
+#   sudo systemctl enable --now autordp
+#   systemctl status autordp
+#   journalctl -u autordp -f
+#
+# Note there is no -d here. systemd wants to own the process and watch it in
+# the foreground; a service that forks away from its manager is a service the
+# manager cannot see. `--hold` is the right mode: it stays in the foreground,
+# does not read stdin, and exits cleanly on the SIGTERM systemd sends.
+
+[Unit]
+Description=autordp - hold an RDP session open and serve the live view
+Documentation=https://github.com/ayushshukla8920/autoRDP
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=%i
+WorkingDirectory=%h/autordp
+
+# The password. DPAPI is Windows-only, so there is no encrypted store on Linux
+# and `config set --remember-password` cannot help here.
+#
+# Do NOT put it in this file -- it is world-readable in /etc/systemd/system.
+# Use a root-owned environment file, or better, fetch it at start from SSM:
+#
+#   EnvironmentFile=/etc/autordp.env        (chmod 600, root:root)
+#
+# or, with the AWS CLI installed:
+#
+#   ExecStartPre=/bin/sh -c 'aws ssm get-parameter --name /autordp/password \
+#       --with-decryption --query Parameter.Value --output text \
+#       > /run/autordp.pass && chmod 600 /run/autordp.pass'
+EnvironmentFile=-/etc/autordp.env
+Environment=NO_COLOR=1
+
+# --conn 1 picks the saved connection; `autordp list` shows the numbers.
+# The live view stays on localhost: it is unauthenticated, and 0.0.0.0 on a
+# public instance publishes a live picture of the remote desktop. Reach it with
+#   ssh -L 8900:127.0.0.1:8900 ec2-user@<instance>
+ExecStart=/usr/bin/env autordp connect --conn 1 --hold --no-input \
+    --view --port 8900 --view-host 127.0.0.1 --color never
+
+# SIGTERM is what --hold traps to disconnect the RDP session cleanly. Give it
+# room to finish the keystroke it is on before SIGKILL.
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+Restart=on-failure
+RestartSec=10s
+# A session that dies instantly is a bad password or an unreachable host, and
+# hammering the server helps nobody. Five tries a minute, then stop and be
+# visible in `systemctl status` rather than retrying forever.
+StartLimitBurst=5
+StartLimitIntervalSec=60
+
+# It only needs to talk to the network and write its own directory.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/autordp
+
+[Install]
+WantedBy=multi-user.target

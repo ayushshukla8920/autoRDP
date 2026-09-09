@@ -33,6 +33,9 @@ EXIT_INTERRUPTED = 130
 COMMANDS = {
     "connect": commands.connect,
     "repo": commands.repo,
+    "list": commands.connections,
+    "status": commands.status,
+    "stop": commands.stop,
     "config": commands.config,
     "doctor": commands.doctor,
     "keys": commands.keys,

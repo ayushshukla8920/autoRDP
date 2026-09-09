@@ -72,14 +72,16 @@ jobs:
           for argv in [
               ["--version"], ["--help"],
               ["connect", "--help"], ["repo", "--help"], ["config", "--help"],
-              ["doctor", "--help"], ["keys", "--help"],
+              ["doctor", "--help"], ["keys", "--help"], ["list", "--help"],
               ["connect", "-c", "type hello", "--keep-open", "--view"],
+              ["connect", "--hold", "--conn", "2", "-p", "9000"],
               ["repo", "https://example.com/x.git", "-m", "0", "--dry-run"],
-              ["repo", "u", "--editor", "code", "--view", "9000"],
-              ["config", "set", "--remember-password"],
+              ["repo", "u", "--editor", "code", "-p", "9000"],
+              ["config", "set", "--remember-password", "--name", "prod"],
+              ["config", "forget", "2"],
               ["config", "show", "--json"],
               ["doctor", "--no-network", "--json"],
-              ["keys", "ctrl"],
+              ["keys", "ctrl"], ["list", "--json"],
           ]:
               try:
                   parser.parse(argv)
@@ -106,17 +108,68 @@ jobs:
               (["config", "show"], "config"),
               (["doctor"], "doctor"),
               (["keys"], "keys"),
+              (["list"], "list"),
           ]:
               actual = parser.parse(argv).command
               assert actual == expected, f"{argv} -> {actual!r}, want {expected!r}"
           assert parser.parse(["connect", "-c", "a", "-c", "b"]).run_commands == ["a", "b"]
 
-          # --view is optional-argument: bare means the default port.
-          from autordp.webview import DEFAULT_PORT
-          assert parser.parse(["connect"]).view is None
-          assert parser.parse(["connect", "--view"]).view == DEFAULT_PORT
-          assert parser.parse(["connect", "--view", "9000"]).view == 9000
+          # -p is the LIVE VIEW port. There is no RDP port flag: if -p ever
+          # leaks back into the RDP port, `-p 9000` silently connects to the
+          # wrong place, which parses fine and fails confusingly.
+          assert parser.parse(["connect"]).port is None
+          assert parser.parse(["connect"]).view is False
+          assert parser.parse(["connect", "--view"]).view is True
+          assert parser.parse(["connect", "-p", "9000"]).port == 9000
+          for bad in (["connect", "--rdp-port", "3390"], ["connect", "--view", "9000"]):
+              try:
+                  parser.parse(bad)
+              except SystemExit as exc:
+                  assert exc.code not in (0, None), bad
+              else:
+                  raise AssertionError(f"{bad} should not parse")
+          assert parser.parse(["connect", "--conn", "3"]).conn == 3
+          assert parser.parse(["config", "forget", "2"]).index == 2
+          assert parser.parse(["connect", "--hold"]).hold is True
           print("every subcommand routes on its own name")
+          PY
+
+      # The live-view port must never become the RDP port. This is the one
+      # regression in the flag rework that would be silent rather than loud.
+      - name: The live-view port stays out of the RDP port
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os
+          os.environ.pop("RDP_PORT", None)
+          os.environ["RDP_PROFILE"] = "no-such-profile.json"
+          from autordp.cli import context, parser
+          args = parser.parse(["connect", "-p", "9000", "--host", "h",
+                               "--user", "u", "--password", "x", "--no-input"])
+          settings = context.resolve(args, prompt_missing=False)
+          assert settings.port == 3389, f"live-view port leaked into RDP: {settings.port}"
+          print("-p 9000 sets the live view; RDP stays on 3389")
+          PY
+
+      # Several saved connections, addressed by index.
+      - name: Saved connections round-trip
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os, tempfile
+          os.environ["RDP_PROFILE"] = os.path.join(tempfile.mkdtemp(), "p.json")
+          from autordp import credentials as c
+          assert c.count() == 0
+          c.save({"name": "prod", "host": "10.0.0.5", "username": "admin"})
+          c.save({"name": "lab", "host": "10.0.0.6", "username": "dev"})
+          c.save({"name": "prod2", "host": "10.0.0.5", "username": "admin"})
+          assert c.count() == 2, "same host+user should update, not duplicate"
+          assert c.load(1)["name"] == "prod2"
+          assert c.load(2)["host"] == "10.0.0.6"
+          assert c.load(99) == {}, "out-of-range index must be empty, not raise"
+          assert c.forget(1) and c.count() == 1
+          assert not c.forget(9)
+          print("multi-connection store: add, update, index, forget")
           PY
 
       # The live view is plain HTTP over a PIL image, so it can be exercised

@@ -26,13 +26,14 @@ from .. import credentials
 from ..config import ConfigError, Settings
 from . import ui
 
-# Flag name -> (environment variable, profile key). The single table both the
-# resolver and `config show` read, so they can never drift apart.
+# Flag name -> (environment variable, profile key), for the fields a flag can
+# set. `port` is deliberately absent: `--port` is the *live view* port now, so
+# reading args.port here would make `-p 9000` connect to RDP on 9000. It is
+# resolved from the environment and the saved connection only.
 FIELDS = {
     "host": ("RDP_HOST", "host"),
     "username": ("RDP_USERNAME", "username"),
     "domain": ("RDP_DOMAIN", "domain"),
-    "port": ("RDP_PORT", "port"),
     "width": ("RDP_WIDTH", "width"),
     "height": ("RDP_HEIGHT", "height"),
 }
@@ -45,18 +46,23 @@ def _flag(args: argparse.Namespace, name: str) -> str:
 
 def resolve_password(args: argparse.Namespace, saved: dict,
                      interactive: bool) -> str:
-    """Find a password without ever putting one in the process table.
+    """Find a password, preferring the routes that keep it out of `ps`.
 
-    ``--password`` is deliberately absent from the parser. Anything passed as an
-    argument is visible to ``ps`` and lands in shell history, and there are three
-    better routes already: ``RDP_PASSWORD``, the DPAPI-encrypted profile, and
-    ``--password-stdin`` for a secret piped from a password manager.
+    ``--password`` exists because it is sometimes the only practical option,
+    but it is checked *after* stdin and before nothing else by accident: an
+    argument is visible in ``ps`` output and lands in shell history, so the
+    order here quietly rewards ``--password-stdin``, ``RDP_PASSWORD`` and the
+    encrypted profile.
     """
     if getattr(args, "password_stdin", False):
         secret = sys.stdin.readline().rstrip("\r\n")
         if not secret:
             raise ConfigError("--password-stdin was given but stdin was empty")
         return secret
+
+    flag = (getattr(args, "password", "") or "").strip()
+    if flag:
+        return flag
 
     from_env = os.environ.get("RDP_PASSWORD", "")
     if from_env:
@@ -88,7 +94,15 @@ def resolve(args: argparse.Namespace, *, prompt_missing: bool | None = None) -> 
     ``prompt_missing`` overrides the terminal test -- the interactive menu sets
     it True so that it can re-ask for details even when a profile exists.
     """
-    saved = credentials.load()
+    index = getattr(args, "conn", None)
+    saved = credentials.load(index)
+    if index is not None and not saved:
+        total = credentials.count()
+        raise ConfigError(
+            f"No saved connection {index}. "
+            + (f"There are {total}; run `autordp list` to see them."
+               if total else "Nothing is saved yet -- run `autordp config set`."))
+
     interactive = ui.is_interactive() if prompt_missing is None else prompt_missing
     if getattr(args, "no_input", False):
         interactive = False
@@ -99,15 +113,20 @@ def resolve(args: argparse.Namespace, *, prompt_missing: bool | None = None) -> 
                           or os.environ.get(env_name, "").strip()
                           or saved.get(profile_key, ""))
 
-    if interactive and saved:
-        ui.note(f"remembered details from {credentials.profile_path()}")
+    if saved:
+        where = (f"saved connection {index} ({saved.label})" if index is not None
+                 else f"remembered details from {credentials.profile_path()}")
+        if interactive or index is not None:
+            ui.note(where)
 
-    if interactive:
+    # An explicitly chosen connection is a complete answer. Prompting for
+    # fields it already supplies would make `--conn 2` slower than typing the
+    # host out, which defeats the point of saving it.
+    if interactive and index is None:
         resolved["host"] = ui.prompt("Host / IP", resolved["host"], required=True)
         resolved["username"] = ui.prompt("Username", resolved["username"],
                                          required=True)
         resolved["domain"] = ui.prompt("Domain (blank for none)", resolved["domain"])
-        resolved["port"] = ui.prompt("Port", resolved["port"] or "3389", required=True)
 
     password = resolve_password(args, saved, interactive)
 
@@ -123,7 +142,9 @@ def resolve(args: argparse.Namespace, *, prompt_missing: bool | None = None) -> 
     os.environ["RDP_HOST"] = resolved["host"]
     os.environ["RDP_USERNAME"] = resolved["username"]
     os.environ["RDP_DOMAIN"] = resolved["domain"]
-    os.environ["RDP_PORT"] = resolved["port"] or "3389"
+    # No flag for this one: environment, saved connection, then the default.
+    os.environ["RDP_PORT"] = (os.environ.get("RDP_PORT", "").strip()
+                              or saved.get("port", "") or "3389")
     os.environ["RDP_PASSWORD"] = password
     for name in ("width", "height"):
         if resolved[name]:

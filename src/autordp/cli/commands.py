@@ -19,12 +19,15 @@ import json
 import os
 import re
 import shutil
+import signal
 import socket
 import sys
+import threading
 import time
 from pathlib import Path
 
-from .. import __version__, codebase, credentials, session, shell, webview
+from .. import (__version__, codebase, credentials, daemon, session, shell,
+                webview)
 from ..client import RdpClient
 from ..config import ConfigError, Settings, setup_logging
 from ..input import KEY_ALIASES
@@ -99,11 +102,14 @@ def _client(settings: Settings):
 @contextlib.contextmanager
 def _live_view(client: RdpClient, args: argparse.Namespace):
     """Start the browser view if --view was given; always a no-op otherwise."""
-    if args.view is None:
+    # -p implies --view: asking for a port and not meaning to serve one would
+    # be a strange thing to type.
+    if not args.view and args.port is None:
         yield None
         return
 
-    port = webview.free_port(args.view, args.view_host)
+    wanted = args.port or webview.DEFAULT_PORT
+    port = webview.free_port(wanted, args.view_host)
     view = webview.LiveView(client, port=port, host=args.view_host)
     try:
         url = view.start()
@@ -113,8 +119,8 @@ def _live_view(client: RdpClient, args: argparse.Namespace):
         yield None
         return
 
-    if port != args.view:
-        ui.note(f"port {args.view} was busy, using {port}")
+    if port != wanted:
+        ui.note(f"port {wanted} was busy, using {port}")
     ui.ok(f"live view at {ui.style(url, 'bright_cyan', 'underline')}")
     if view.exposed:
         ui.warn(f"the view is bound to {args.view_host}, so anyone who can "
@@ -163,7 +169,65 @@ def _script_lines(args: argparse.Namespace) -> list[str]:
     return lines
 
 
+def _maybe_detach(args: argparse.Namespace, extra: list[str]) -> int | None:
+    """Re-launch in the background and return an exit code, or None to carry on.
+
+    Called before anything expensive. Detaching after connecting would mean the
+    child inherits a live RDP socket and an event loop mid-flight, which is the
+    kind of thing that works until it does not.
+    """
+    if not args.detach or daemon.is_child():
+        return None
+
+    pid_file = daemon.pid_path(args.pid_file)
+    existing = daemon.read_record(pid_file)
+    if existing and daemon.is_running(existing["pid"]):
+        ui.error(f"a detached run is already going (pid {existing['pid']})",
+                 f"`autordp status` for detail, `autordp stop` to end it. "
+                 f"Use --pid-file to run a second one alongside it.")
+        return 2
+    if existing:
+        daemon.clear(pid_file)
+
+    log = daemon.log_path(args.log_file)
+    argv = daemon.child_argv(sys.argv[1:], drop=("-d", "--detach"), add=extra)
+
+    try:
+        pid = daemon.spawn(argv, log)
+    except OSError as exc:
+        ui.error(f"could not start the background process: {exc}")
+        return 1
+
+    port = args.port if (args.view or args.port) else None
+    daemon.write_record(pid_file, pid, argv, log, view=port)
+
+    # Give it a moment to fall over, so an immediately-broken run is reported
+    # here rather than looking like a success and being found in a log later.
+    time.sleep(1.5)
+    if not daemon.is_running(pid):
+        ui.error("the background process exited immediately",
+                 f"see {log} for why")
+        daemon.clear(pid_file)
+        return 1
+
+    ui.say()
+    ui.ok(f"running in the background, pid {ui.style(str(pid), 'bold')}")
+    ui.kv("log", str(log))
+    ui.kv("pid file", str(pid_file))
+    if port or args.view:
+        ui.kv("live view", f"http://{args.view_host}:{port or webview.DEFAULT_PORT}/")
+    ui.say()
+    ui.note("autordp status    is it still up?")
+    ui.note("autordp stop      disconnect it cleanly")
+    return 0
+
+
 def connect(args: argparse.Namespace) -> int:
+    # A detached connect has no terminal, so it must hold rather than prompt.
+    detached = _maybe_detach(args, ["--hold", "--no-input"])
+    if detached is not None:
+        return detached
+
     settings = _prepare(args)
     scripted = _script_lines(args)
 
@@ -177,9 +241,73 @@ def connect(args: argparse.Namespace) -> int:
             _stop_banner(settings)
             if scripted:
                 code = _run_scripted(loop, client, settings, scripted)
-                if not args.keep_open:
+                if not (args.keep_open or args.hold):
                     return code
+            if args.hold:
+                return _hold(client, settings)
+            if not ui.is_interactive():
+                # Without this the prompt reads EOF immediately and exits 0,
+                # which under a service manager looks like success and gets
+                # restarted forever. Say what to do instead.
+                ui.error("there is no terminal to read commands from",
+                         "pass --hold to keep the session open without a "
+                         "prompt, or -c / --script to run fixed commands")
+                return 2
             return _repl(loop, client, settings)
+
+
+def _hold(client: RdpClient, settings: Settings) -> int:
+    """Keep the session open with no prompt, until something ends it.
+
+    The mode for pm2, systemd and docker, where there is no terminal. It ends
+    on SIGINT or SIGTERM -- both of which a service manager sends on stop, and
+    both of which must unwind through the normal disconnect so the RDP session
+    is closed rather than abandoned.
+    """
+    ending = threading.Event()
+    reason = {"why": "signal"}
+
+    def on_signal(number, _frame) -> None:
+        try:
+            reason["why"] = signal.Signals(number).name
+        except ValueError:
+            reason["why"] = f"signal {number}"
+        ending.set()
+
+    previous = {}
+    for name in ("SIGINT", "SIGTERM", "SIGHUP"):
+        received = getattr(signal, name, None)
+        if received is None:
+            continue
+        try:
+            previous[received] = signal.signal(received, on_signal)
+        except (ValueError, OSError):
+            # No SIGHUP on Windows, and signal() only works on the main thread.
+            pass
+
+    ui.say()
+    ui.ok("holding the session open -- send SIGINT or SIGTERM to stop")
+    started = time.monotonic()
+    try:
+        while not ending.wait(1.0):
+            if not client.is_alive:
+                ui.error("the RDP session disconnected",
+                         "the server may have ended it, or the network dropped")
+                return 1
+            if client.stop.tripped:
+                ui.warn("emergency stop tripped; disconnecting")
+                return 3
+    finally:
+        for received, handler in previous.items():
+            try:
+                signal.signal(received, handler)
+            except (ValueError, OSError):
+                pass
+
+    ui.say()
+    ui.ok(f"{reason['why']} after {ui.duration(time.monotonic() - started)}; "
+          f"disconnecting cleanly")
+    return 0
 
 
 def _run_scripted(loop: LoopThread, client: RdpClient, settings: Settings,
@@ -281,7 +409,13 @@ def _readline() -> None:
 
 def repo(args: argparse.Namespace) -> int:
     if args.dry_run:
+        # Planning is quick and its whole output is the point, so detaching it
+        # would hide the only thing you ran it for.
         return _repo_dry_run(args)
+
+    detached = _maybe_detach(args, ["--no-input"])
+    if detached is not None:
+        return detached
 
     settings = _prepare(args)
     ui.title("Typing a codebase", f"{args.editor} on {settings.host}")
@@ -410,6 +544,140 @@ def _repo_dry_run(args: argparse.Namespace) -> int:
         shutil.rmtree(checkout.parent, ignore_errors=True)
 
 
+# ------------------------------------------------------------ status / stop
+
+def status(args: argparse.Namespace) -> int:
+    """Is the detached run alive? Exit 0 if yes, 1 if not."""
+    pid_file = daemon.pid_path(args.pid_file)
+    record = daemon.read_record(pid_file)
+
+    if record is None:
+        if args.json:
+            ui.emit(json.dumps({"running": False, "pid_file": str(pid_file)}))
+        else:
+            ui.warn(f"no detached run recorded at {pid_file}")
+            ui.note("start one with:  autordp connect -d --view")
+        return 1
+
+    pid = int(record["pid"])
+    alive = daemon.is_running(pid)
+    uptime = time.time() - float(record.get("started", time.time()))
+
+    if args.json:
+        ui.emit(json.dumps({**record, "running": alive,
+                            "uptime_seconds": round(uptime, 1),
+                            "pid_file": str(pid_file)}, indent=2))
+        return 0 if alive else 1
+
+    if not alive:
+        ui.fail(f"pid {pid} is not running -- it exited or was killed")
+        ui.kv("log", str(record.get("log", "?")))
+        ui.note(f"the record at {pid_file} is stale; the next -d run clears it")
+        return 1
+
+    ui.title("Detached run", f"pid {pid}")
+    ui.kv("uptime", ui.duration(uptime))
+    ui.kv("command", " ".join(record.get("argv", [])) or "?")
+    ui.kv("log", str(record.get("log", "?")))
+    if record.get("view"):
+        ui.kv("live view", f"http://127.0.0.1:{record['view']}/")
+    ui.say()
+    ui.note("autordp stop    disconnect it cleanly")
+    return 0
+
+
+def stop(args: argparse.Namespace) -> int:
+    pid_file = daemon.pid_path(args.pid_file)
+    record = daemon.read_record(pid_file)
+    if record is None:
+        ui.warn(f"no detached run recorded at {pid_file}")
+        return 1
+
+    pid = int(record["pid"])
+    if not daemon.is_running(pid):
+        ui.note(f"pid {pid} was already gone; clearing {pid_file}")
+        daemon.clear(pid_file)
+        return 0
+
+    # The stop file is the fallback route into the same shutdown, for when the
+    # signal cannot be delivered. Resolving it the way a run would means the
+    # daemon is watching the file we actually write.
+    stop_file = Path(os.environ.get("RDP_STOP_FILE") or (Path.cwd() / "STOP"))
+
+    with ui.spinner(f"Stopping pid {pid}"):
+        gone = daemon.terminate(pid, stop_file=stop_file, timeout=args.timeout)
+
+    if not gone and args.force:
+        ui.warn(f"still alive after {args.timeout:g}s -- killing it")
+        daemon.kill(pid)
+        time.sleep(1.0)
+        gone = not daemon.is_running(pid)
+
+    # Whatever route was taken, do not leave the sentinel behind: a stale STOP
+    # file blocks every later run from sending any input at all.
+    try:
+        if stop_file.exists():
+            stop_file.unlink()
+    except OSError:
+        pass
+
+    if not gone:
+        ui.error(f"pid {pid} did not stop within {args.timeout:g}s",
+                 "re-run with --force to kill it")
+        return 1
+
+    daemon.clear(pid_file)
+    ui.ok(f"stopped, and the RDP session was disconnected cleanly")
+    return 0
+
+
+# ---------------------------------------------------------------------- list
+
+def connections(args: argparse.Namespace) -> int:
+    """`autordp list` -- saved connections, numbered for --conn N."""
+    saved = credentials.load_all()
+
+    if args.json:
+        ui.emit(json.dumps({
+            "path": str(credentials.profile_path()),
+            "connections": [
+                {"index": number, "name": entry.get("name", ""),
+                 "host": entry.get("host", ""),
+                 "username": entry.get("username", ""),
+                 "domain": entry.get("domain", ""),
+                 "port": entry.get("port", "3389"),
+                 "password_saved": credentials.has_saved_password(number)}
+                for number, entry in enumerate(saved, start=1)],
+        }, indent=2))
+        return 0
+
+    if not saved:
+        ui.warn(f"no saved connections at {credentials.profile_path()}")
+        ui.note("run `autordp config set` to save one")
+        return 0
+
+    ui.title("Saved connections", str(credentials.profile_path()))
+    rows = []
+    for number, entry in enumerate(saved, start=1):
+        target = entry.get("host", "?")
+        if entry.get("port") and entry["port"] != "3389":
+            target += ":" + entry["port"]
+        who = entry.get("username", "?")
+        if entry.get("domain"):
+            who = entry["domain"] + "\\" + who
+        rows.append((
+            str(number),
+            entry.get("name", "") or ui.style("-", "grey"),
+            f"{who}@{target}",
+            ui.style("saved", "green") if credentials.has_saved_password(number)
+            else ui.style("-", "grey"),
+        ))
+    ui.table(rows, headers=("#", "name", "target", "password"))
+    ui.say()
+    ui.note(f"use one with:  autordp connect --conn {len(saved)}")
+    return 0
+
+
 # -------------------------------------------------------------------- config
 
 _ENV_VARS = [
@@ -450,27 +718,34 @@ def config(args: argparse.Namespace) -> int:
 
 
 def _config_show(args: argparse.Namespace) -> int:
-    saved = credentials.load()
-    has_password = credentials.has_saved_password()
+    """The full detail of one connection. `autordp list` is the overview."""
+    index = getattr(args, "conn", None)
+    saved = credentials.load(index)
+    has_password = credentials.has_saved_password(index)
     if args.json:
         payload = {key: saved.get(key, "") for key in credentials.PROFILE_FIELDS}
+        payload["name"] = saved.get("name", "")
         payload["password_saved"] = has_password
         payload["path"] = str(credentials.profile_path())
         ui.emit(json.dumps(payload, indent=2))
         return 0
 
     path = credentials.profile_path()
-    if not saved and not path.exists():
-        ui.warn(f"nothing saved at {path}")
-        ui.note("run `autordp config set` to remember a connection")
+    if not saved:
+        ui.warn(f"nothing saved at {path}" if not credentials.count()
+                else f"no saved connection {index}")
+        ui.note("run `autordp config set` to remember a connection, "
+                "or `autordp list` to see what is saved")
         return 0
 
-    ui.title("Saved profile", str(path))
+    total = credentials.count()
+    ui.title(f"Connection {index or 1} of {total}", saved.label)
     for key in credentials.PROFILE_FIELDS:
         value = saved.get(key, "")
         ui.kv(key, value if value else ui.style("(not set)", "grey"))
     ui.kv("password", ui.style("saved, DPAPI-encrypted", "green") if has_password
           else ui.style("not saved", "grey"))
+    ui.kv("file", str(path))
     return 0
 
 
@@ -507,12 +782,18 @@ def _config_set(args: argparse.Namespace) -> int:
     with _client(settings) as (client, loop):
         _connect(client, loop)
         remember = args.remember_password or args.remember
-        path = settings.remember(remember_password=remember)
+        values = settings.as_profile()
+        if getattr(args, "name", None):
+            values["name"] = args.name
+        path = credentials.save(values, remember_password=remember,
+                                index=getattr(args, "conn", None))
 
     if path is None:
         ui.error("the connection worked but the profile could not be written")
         return 2
-    ui.ok(f"saved to {path}")
+    ui.ok(f"saved to {path} as connection {credentials.count()}")
+    ui.note("use it with:  autordp connect --conn "
+            f"{credentials.count()}   (`autordp list` shows them all)")
     if remember:
         if credentials.has_saved_password():
             ui.note("password saved, encrypted for this Windows user (DPAPI)")
@@ -527,10 +808,25 @@ def _config_set(args: argparse.Namespace) -> int:
 
 def _config_forget(args: argparse.Namespace) -> int:
     path = credentials.profile_path()
-    if credentials.forget():
-        ui.ok(f"removed {path}")
+    index = getattr(args, "index", None)
+    if index is None:
+        if credentials.forget():
+            ui.ok(f"removed every saved connection ({path})")
+        else:
+            ui.note(f"nothing saved at {path}")
+        return 0
+
+    saved = credentials.load(index)
+    if not saved:
+        ui.error(f"no saved connection {index}",
+                 "`autordp list` shows what is saved")
+        return 2
+    label = saved.label
+    if credentials.forget(index):
+        ui.ok(f"removed connection {index} ({label})")
     else:
-        ui.note(f"nothing saved at {path}")
+        ui.error(f"could not remove connection {index}")
+        return 2
     return 0
 
 

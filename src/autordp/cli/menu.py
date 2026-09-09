@@ -26,9 +26,10 @@ from . import parser, ui
 
 # Flags typed before the menu appeared. `autordp --host box repo u` is one
 # thing, but `autordp --host box` lands here, and the host must not be lost.
-_CARRIED = ("host", "username", "domain", "port", "auth", "width", "height",
-            "password_stdin", "remember", "no_input", "quiet", "verbose",
-            "json", "color", "ascii", "log_file", "view", "view_host")
+_CARRIED = ("host", "username", "domain", "auth", "width", "height", "conn",
+            "password", "password_stdin", "remember", "no_input", "quiet",
+            "verbose", "json", "color", "ascii", "log_file", "view", "port",
+            "view_host")
 
 CHOICES = [
     ("Test connection", "connect",
