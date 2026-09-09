@@ -81,6 +81,55 @@ def child_argv(argv: list[str], drop: tuple[str, ...], add: list[str]) -> list[s
     return kept + [token for token in add if token not in kept]
 
 
+# PyInstaller's one-file bootloader unpacks the archive to a temporary
+# directory and sets these to tell a *second* stage "already unpacked, reuse
+# it". A detached child that inherits them skips extraction and runs out of the
+# parent's directory -- which the parent deletes when it exits a second later.
+# The child then dies on the next lazy import with
+#
+#     FileNotFoundError: /tmp/_MEIxxxxxx/base_library.zip
+#
+# It is a race, so it looks intermittent: whether it survives depends on
+# whether anything still needed importing after the parent went away.
+#
+# `_MEIPASS2` is the pre-6.x name, the `_PYI_*` ones are current. Clearing all
+# of them makes the child unpack its own copy, which it then owns and cleans up
+# itself.
+_BOOTLOADER_VARS = (
+    "_MEIPASS2",
+    "_PYI_ARCHIVE_FILE",
+    "_PYI_APPLICATION_HOME_DIR",
+    "_PYI_PARENT_PROCESS_LEVEL",
+    "_PYI_SPLASH_IPC",
+)
+
+# The bootloader also points the dynamic linker at its temporary directory,
+# stashing whatever was there before under `<NAME>_ORIG`. Handing the child the
+# modified value would aim it at a directory that is about to be deleted, so
+# each is restored to what it was before the program started.
+_LIBRARY_PATH_VARS = ("LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH",
+                      "DYLD_FRAMEWORK_PATH", "LIBPATH")
+
+
+def child_environment() -> dict[str, str]:
+    """The parent's environment, cleaned of anything that would break a re-exec."""
+    environment = dict(os.environ)
+    environment[MARKER] = "1"
+
+    if not getattr(sys, "frozen", False):
+        return environment
+
+    for name in _BOOTLOADER_VARS:
+        environment.pop(name, None)
+    for name in _LIBRARY_PATH_VARS:
+        original = environment.pop(f"{name}_ORIG", None)
+        if original is not None:
+            environment[name] = original
+        else:
+            environment.pop(name, None)
+    return environment
+
+
 def spawn(argv: list[str], log: Path) -> int:
     """Start the detached child and return its pid.
 
@@ -95,7 +144,7 @@ def spawn(argv: list[str], log: Path) -> int:
         handle.write(f"\n=== autordp detached at {time.strftime('%Y-%m-%d %H:%M:%S')} "
                      f"===\n".encode())
 
-        environment = dict(os.environ, **{MARKER: "1"})
+        environment = child_environment()
         keywords: dict = {
             "stdin": subprocess.DEVNULL,
             "stdout": handle,
@@ -125,6 +174,39 @@ def spawn(argv: list[str], log: Path) -> int:
 
 # ------------------------------------------------------------------ liveness
 
+#: Options whose value must never be written down or printed back.
+_SECRET_OPTIONS = ("--password",)
+
+
+def redact(argv: list[str]) -> list[str]:
+    """``argv`` with secret values replaced, for storing and for display.
+
+    The recorded command line is genuinely useful -- it is how `status` tells
+    you which run this is -- but recording it verbatim put `--password hunter2`
+    in a plain JSON file and printed it back on screen. Both forms argparse
+    accepts have to be handled: the separate value and the ``--password=x``
+    spelling.
+    """
+    safe: list[str] = []
+    skip_next = False
+    for token in argv:
+        if skip_next:
+            safe.append("***")
+            skip_next = False
+            continue
+        if token in _SECRET_OPTIONS:
+            safe.append(token)
+            skip_next = True
+            continue
+        matched = next((o for o in _SECRET_OPTIONS if token.startswith(o + "=")),
+                       None)
+        if matched:
+            safe.append(f"{matched}=***")
+            continue
+        safe.append(token)
+    return safe
+
+
 def write_record(path: Path, pid: int, argv: list[str], log: Path,
                  view: int | None = None) -> None:
     """Record the daemon, as JSON rather than a bare pid.
@@ -133,16 +215,25 @@ def write_record(path: Path, pid: int, argv: list[str], log: Path,
     can name a process that now belongs to something else entirely. Storing
     the start time and the command line lets :func:`is_running` tell the
     difference before it reports -- or worse, kills -- the wrong thing.
+
+    The command line is redacted on the way in, not on the way out, so a
+    secret never reaches the disk in the first place.
     """
     record = {
         "pid": pid,
         "started": time.time(),
-        "argv": argv,
+        "argv": redact(argv),
         "log": str(log),
         "view": view,
     }
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(record, indent=2), encoding="utf-8")
+    # The record can still name a host and a username, and it sits in whatever
+    # directory the run was started from.
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
 
 
 def read_record(path: Path) -> dict | None:

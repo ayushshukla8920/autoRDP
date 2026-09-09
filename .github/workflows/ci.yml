@@ -151,6 +151,63 @@ jobs:
           print("-p 9000 sets the live view; RDP stays on 3389")
           PY
 
+      # Both of these shipped broken in 0.2.0 and are invisible from a
+      # checkout, because they only bite a PyInstaller one-file build.
+      - name: Detaching does not break a frozen build
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os, sys
+          from autordp import daemon
+
+          # What a one-file child would inherit from its parent. Leaving these
+          # in makes the child's bootloader skip extraction and run out of the
+          # parent's /tmp/_MEIxxxx -- which the parent deletes on exit, so the
+          # child dies on its next lazy import with
+          #   FileNotFoundError: /tmp/_MEIxxxx/base_library.zip
+          os.environ.update({
+              "_MEIPASS2": "/tmp/_MEIabc",
+              "_PYI_ARCHIVE_FILE": "/usr/bin/autordp",
+              "_PYI_APPLICATION_HOME_DIR": "/tmp/_MEIabc",
+              "LD_LIBRARY_PATH": "/tmp/_MEIabc",
+              "LD_LIBRARY_PATH_ORIG": "/usr/local/lib",
+              "RDP_PASSWORD": "keep-me",
+          })
+          sys.frozen = True
+          try:
+              child = daemon.child_environment()
+          finally:
+              del sys.frozen
+
+          for name in daemon._BOOTLOADER_VARS:
+              assert name not in child, f"{name} leaked into the child"
+          assert child["LD_LIBRARY_PATH"] == "/usr/local/lib", child["LD_LIBRARY_PATH"]
+          assert "LD_LIBRARY_PATH_ORIG" not in child
+          assert child["RDP_PASSWORD"] == "keep-me", "real environment was dropped"
+          assert child[daemon.MARKER] == "1"
+          print("frozen child gets its own extraction, keeps the real environment")
+          PY
+
+      - name: The pid file never holds a password
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json, pathlib, tempfile
+          from autordp import daemon
+
+          for argv in (["repo", "u", "--password", "hunter2"],
+                       ["repo", "u", "--password=hunter2"]):
+              assert "hunter2" not in " ".join(daemon.redact(argv)), argv
+
+          path = pathlib.Path(tempfile.mkdtemp()) / "autordp.pid"
+          daemon.write_record(path, 123, ["repo", "u", "--password", "hunter2"],
+                              pathlib.Path("x.log"), view=8900)
+          raw = path.read_text(encoding="utf-8")
+          assert "hunter2" not in raw, "secret written to disk: " + raw
+          assert json.loads(raw)["pid"] == 123
+          print("pid file redacts secrets")
+          PY
+
       # Several saved connections, addressed by index.
       - name: Saved connections round-trip
         shell: bash
