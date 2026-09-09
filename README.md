@@ -918,7 +918,26 @@ DPAPI will not decrypt it there. You are prompted for the password instead —
 reconnect with `--remember` to re-save it.
 
 **`git is not on PATH`**
-Install Git for Windows. Only the codebase actions need it.
+Install Git for Windows, or `git` from your package manager on Linux and
+macOS. Only the codebase actions need it.
+
+**`git clone failed: fatal: remote helper 'https' aborted session`**
+`git-remote-https` died before it spoke any protocol, and the usual reason is
+a library mismatch: something has pointed the dynamic linker somewhere other
+than the system libraries, so git loads the wrong `libcrypto`/`libssl` and
+exits on a symbol lookup. The frozen binary used to cause exactly this on
+Linux and macOS by handing git its own bundled libraries; that is fixed (the
+subprocess environment is restored first — `autordp/environment.py`). If you
+still see it, check for an `LD_LIBRARY_PATH` in your own shell or unit file,
+and confirm the clone works by hand:
+
+```bash
+env -u LD_LIBRARY_PATH git clone --depth 1 https://github.com/<owner>/<repo> /tmp/t
+```
+
+The message keeps the last few lines of git's output, newest first, so the
+line that names the real cause is in it rather than only the `aborted session`
+summary.
 
 **A codebase run says it would take hours**
 It would — see [section 9](#10-typing-a-codebase). Lower the minute budget, or
@@ -1020,6 +1039,8 @@ autordp/
 │   ├── session.py        editor profiles and the codebase typing flow
 │   ├── codebase.py       git clone, file selection, time budgeting
 │   ├── webview.py        the read-only live view, over HTTP
+│   ├── daemon.py         detaching with `-d`, the pid file, stopping
+│   ├── environment.py    what a child process inherits from a frozen build
 │   │
 │   └── cli/
 │       ├── main.py       dispatch, and the one place exceptions become exit codes

@@ -18,12 +18,15 @@ order until the projected time runs out, and everything skipped is reported.
 from __future__ import annotations
 
 import logging
+import os
 import re
 import shutil
 import subprocess
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
+
+from .environment import system_environment
 
 logger = logging.getLogger("autordp.codebase")
 
@@ -79,7 +82,9 @@ def clone(url: str, into: Path | None = None, timeout: float = 300.0) -> Path:
     """Shallow-clone ``url`` locally and return the checkout directory."""
     if shutil.which("git") is None:
         raise CodebaseError(
-            "git is not on PATH. Install Git for Windows to clone repositories.")
+            "git is not on PATH. Install Git for Windows to clone repositories."
+            if os.name == "nt" else
+            "git is not on PATH. Install git to clone repositories.")
 
     target = Path(into) if into else Path(tempfile.mkdtemp(prefix="rdp-repo-"))
     target.mkdir(parents=True, exist_ok=True)
@@ -91,15 +96,38 @@ def clone(url: str, into: Path | None = None, timeout: float = 300.0) -> Path:
     try:
         result = subprocess.run(
             ["git", "clone", "--depth", "1", "--quiet", url, str(checkout)],
-            capture_output=True, text=True, timeout=timeout, check=False)
+            capture_output=True, text=True, timeout=timeout, check=False,
+            # Not `os.environ`: on a frozen build that points the dynamic
+            # linker at the bundled libraries, and git-remote-https dies
+            # loading them. See autordp/environment.py.
+            #
+            # GIT_TERMINAL_PROMPT=0 because a detached run has no terminal to
+            # prompt on: a private URL should fail saying so, in a second,
+            # rather than sit on a credential helper until the timeout.
+            env={**system_environment(), "GIT_TERMINAL_PROMPT": "0"})
     except subprocess.TimeoutExpired:
         raise CodebaseError(f"git clone timed out after {timeout:.0f}s") from None
 
     if result.returncode != 0:
-        detail = (result.stderr or result.stdout or "").strip().splitlines()
-        raise CodebaseError(
-            f"git clone failed: {detail[-1] if detail else 'unknown error'}")
+        raise CodebaseError(f"git clone failed: {_why(result)}")
     return checkout
+
+
+def _why(result: subprocess.CompletedProcess) -> str:
+    """git's complaint, in one line.
+
+    The last line alone is not enough. When a transport helper dies, git's
+    final word is only `fatal: remote helper 'https' aborted session`; the
+    line above it is the one that says why -- a symbol lookup error, a missing
+    shared object, a refused authentication. Keeping the last few, newest
+    first, puts the cause in the message instead of in a log nobody kept.
+    """
+    lines = [line.strip() for line in
+             (result.stderr or result.stdout or "").strip().splitlines()
+             if line.strip()]
+    if not lines:
+        return f"no output, exit status {result.returncode}"
+    return " <- ".join(reversed(lines[-3:]))
 
 
 def _is_typable(text: str) -> tuple[bool, str]:

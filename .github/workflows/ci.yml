@@ -55,7 +55,8 @@ jobs:
                        "autordp.cli.main", "autordp.client", "autordp.codebase",
                        "autordp.config", "autordp.credentials", "autordp.input",
                        "autordp.loop", "autordp.session", "autordp.shell",
-                       "autordp.webview"):
+                       "autordp.webview", "autordp.daemon",
+                       "autordp.environment"):
               importlib.import_module(name)
               print("ok", name)
           PY
@@ -158,7 +159,7 @@ jobs:
         run: |
           python - <<'PY'
           import os, sys
-          from autordp import daemon
+          from autordp import daemon, environment
 
           # What a one-file child would inherit from its parent. Leaving these
           # in makes the child's bootloader skip extraction and run out of the
@@ -179,13 +180,55 @@ jobs:
           finally:
               del sys.frozen
 
-          for name in daemon._BOOTLOADER_VARS:
+          for name in environment._BOOTLOADER_VARS:
               assert name not in child, f"{name} leaked into the child"
           assert child["LD_LIBRARY_PATH"] == "/usr/local/lib", child["LD_LIBRARY_PATH"]
           assert "LD_LIBRARY_PATH_ORIG" not in child
           assert child["RDP_PASSWORD"] == "keep-me", "real environment was dropped"
           assert child[daemon.MARKER] == "1"
           print("frozen child gets its own extraction, keeps the real environment")
+          PY
+
+      # The bug this guards: git inherits LD_LIBRARY_PATH from a frozen build,
+      # git-remote-https loads the *bundled* libcrypto instead of the one it
+      # was built against, and dies on a symbol lookup. git reports only
+      #   fatal: remote helper 'https' aborted session
+      # which says nothing about why. It needs a distro whose OpenSSL differs
+      # from the build image's to reproduce for real, so assert the
+      # environment git is handed rather than the clone itself.
+      - name: Cloning does not hand git the bundled libraries
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os, subprocess, sys, tempfile
+          from pathlib import Path
+          from unittest.mock import patch
+          from autordp import codebase
+
+          os.environ.update({"LD_LIBRARY_PATH": "/tmp/_MEIabc",
+                             "LD_LIBRARY_PATH_ORIG": "/usr/local/lib",
+                             "_MEIPASS2": "/tmp/_MEIabc"})
+          seen = {}
+
+          def fake_run(argv, **keywords):
+              seen.update(keywords, argv=argv)
+              return subprocess.CompletedProcess(argv, 0, "", "")
+
+          sys.frozen = True
+          try:
+              with patch("autordp.codebase.subprocess.run", fake_run):
+                  codebase.clone("https://github.com/o/r",
+                                 into=Path(tempfile.mkdtemp()))
+          finally:
+              del sys.frozen
+
+          handed = seen["env"]
+          assert handed["LD_LIBRARY_PATH"] == "/usr/local/lib", handed["LD_LIBRARY_PATH"]
+          assert "LD_LIBRARY_PATH_ORIG" not in handed
+          assert "_MEIPASS2" not in handed
+          assert handed["GIT_TERMINAL_PROMPT"] == "0", "a detached run has no terminal to prompt on"
+          assert handed.get("PATH"), "git needs the real PATH"
+          print("git is handed the system libraries, not the bundled ones")
           PY
 
       - name: The pid file never holds a password

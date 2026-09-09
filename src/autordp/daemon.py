@@ -40,6 +40,8 @@ import sys
 import time
 from pathlib import Path
 
+from .environment import system_environment
+
 # The environment marker that tells a child it is the detached copy. Without
 # it the child would read `-d` from its own argv and detach again, forever.
 MARKER = "AUTORDP_DETACHED"
@@ -81,52 +83,16 @@ def child_argv(argv: list[str], drop: tuple[str, ...], add: list[str]) -> list[s
     return kept + [token for token in add if token not in kept]
 
 
-# PyInstaller's one-file bootloader unpacks the archive to a temporary
-# directory and sets these to tell a *second* stage "already unpacked, reuse
-# it". A detached child that inherits them skips extraction and runs out of the
-# parent's directory -- which the parent deletes when it exits a second later.
-# The child then dies on the next lazy import with
-#
-#     FileNotFoundError: /tmp/_MEIxxxxxx/base_library.zip
-#
-# It is a race, so it looks intermittent: whether it survives depends on
-# whether anything still needed importing after the parent went away.
-#
-# `_MEIPASS2` is the pre-6.x name, the `_PYI_*` ones are current. Clearing all
-# of them makes the child unpack its own copy, which it then owns and cleans up
-# itself.
-_BOOTLOADER_VARS = (
-    "_MEIPASS2",
-    "_PYI_ARCHIVE_FILE",
-    "_PYI_APPLICATION_HOME_DIR",
-    "_PYI_PARENT_PROCESS_LEVEL",
-    "_PYI_SPLASH_IPC",
-)
-
-# The bootloader also points the dynamic linker at its temporary directory,
-# stashing whatever was there before under `<NAME>_ORIG`. Handing the child the
-# modified value would aim it at a directory that is about to be deleted, so
-# each is restored to what it was before the program started.
-_LIBRARY_PATH_VARS = ("LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH",
-                      "DYLD_FRAMEWORK_PATH", "LIBPATH")
-
-
 def child_environment() -> dict[str, str]:
-    """The parent's environment, cleaned of anything that would break a re-exec."""
-    environment = dict(os.environ)
+    """The environment for the detached copy of this program.
+
+    ``system_environment`` undoes the frozen build's edits to the environment,
+    without which the child either races the parent's temporary directory to
+    deletion or is aimed at it after the fact. The marker is what stops the
+    child reading `-d` from its own argv and detaching again, forever.
+    """
+    environment = system_environment()
     environment[MARKER] = "1"
-
-    if not getattr(sys, "frozen", False):
-        return environment
-
-    for name in _BOOTLOADER_VARS:
-        environment.pop(name, None)
-    for name in _LIBRARY_PATH_VARS:
-        original = environment.pop(f"{name}_ORIG", None)
-        if original is not None:
-            environment[name] = original
-        else:
-            environment.pop(name, None)
     return environment
 
 
